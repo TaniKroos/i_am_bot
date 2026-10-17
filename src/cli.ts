@@ -99,6 +99,34 @@ switch (cmd) {
     console.log(`folder: ${out.dir}\npdf: ${out.pdf ?? "(none)"}`);
     break;
   }
+  case "plan": {
+    // Dry run of the answer engine: read each matched job's form and answer it. Submits nothing.
+    const { planApplication, recordPendingQuestions } = await import("./agents/jobs/apply/plan.js");
+    const verbose = args.includes("-v");
+    const jobs = db
+      .prepare(`SELECT id, title, company_name FROM jobs WHERE status = 'matched' AND ats = 'greenhouse' ORDER BY score DESC`)
+      .all() as { id: string; title: string; company_name: string }[];
+    const pending: { question: string; company: string; title: string }[] = [];
+    let ready = 0;
+    for (const j of jobs) {
+      const plan = await planApplication(db, j.id, "<tailored resume>");
+      const counts = plan.fields.reduce<Record<string, number>>((m, p) => {
+        const k = p.answer.kind === "value" ? p.answer.source : p.answer.kind;
+        m[k] = (m[k] ?? 0) + 1;
+        return m;
+      }, {});
+      if (!plan.blockers.length) ready++;
+      console.log(`${plan.blockers.length ? "⏸ " : "✅"} ${j.title} @ ${j.company_name}  ${JSON.stringify(counts)}`);
+      for (const b of plan.blockers) console.log(`     needs you: ${b.slice(0, 140)}`);
+      if (verbose)
+        for (const p of plan.fields)
+          console.log(`     · ${p.field.label.slice(0, 60)} [${p.field.type}${p.field.required ? "*" : ""}] → ${p.answer.kind === "value" ? `${p.answer.note ?? p.answer.value} (${p.answer.source})` : p.answer.kind === "skip" ? `skip: ${p.answer.reason}` : "ASK"}`);
+      pending.push(...plan.blockers.map((question) => ({ question, company: j.company_name, title: j.title })));
+    }
+    const n = recordPendingQuestions(pending, { replace: true });
+    console.log(`\n${ready}/${jobs.length} ready to fill with no questions; ${n} distinct questions for you in profile/questions-pending.yaml`);
+    break;
+  }
   case "rejections": {
     const rows = db
       .prepare(`SELECT json_extract(reasons, '$[0]') reason, COUNT(*) n FROM jobs WHERE status = 'rejected' GROUP BY 1 ORDER BY n DESC LIMIT 25`)
