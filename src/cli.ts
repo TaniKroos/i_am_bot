@@ -1,7 +1,7 @@
 import { getDb } from "./core/db.js";
 import { Runtime } from "./core/runtime.js";
 import { jobsAgent } from "./agents/jobs/index.js";
-import { SEED_TIER1, SEED_TIER2 } from "./agents/jobs/seed.js";
+import { SEED_TIER1, SEED_TIER2, SEED_URLS } from "./agents/jobs/seed.js";
 
 const runtime = new Runtime();
 runtime.register(jobsAgent);
@@ -18,12 +18,26 @@ const ago = (ms: number | null) => {
 
 switch (cmd) {
   case "seed": {
-    for (const name of SEED_TIER1) ctx.enqueue("resolve_company", { name, tier: 1, source: "seed" }, { dedupeKey: `resolve:${name}` });
-    for (const name of SEED_TIER2) ctx.enqueue("resolve_company", { name, tier: 2, source: "seed" }, { dedupeKey: `resolve:${name}` });
+    for (const s of SEED_URLS) ctx.enqueue("resolve_url", { url: s.url, name: s.name, tier: s.tier ?? 2, source: "seed" }, { dedupeKey: `resolve_url:${s.url}` });
+    const tier1 = new Set(SEED_TIER1);
+    const resolved = new Set(db.prepare("SELECT name FROM companies").pluck().all() as string[]);
+    for (const name of new Set([...SEED_TIER1, ...SEED_TIER2].filter((n) => !resolved.has(n)))) {
+      ctx.enqueue("resolve_company", { name, tier: tier1.has(name) ? 1 : 2, source: "seed" }, { dedupeKey: `resolve:${name}` });
+    }
     await runtime.drain();
-    const n = db.prepare("SELECT ats, COUNT(*) n FROM companies GROUP BY ats").all();
-    const u = db.prepare("SELECT COUNT(*) FROM unresolved_companies").pluck().get();
-    console.log("companies by ATS:", n, "| unresolved (likely Workday/custom):", u);
+    const n = db.prepare("SELECT ats, COUNT(*) n, SUM(tier = 1) hot FROM companies WHERE active = 1 GROUP BY ats").all();
+    const total = db.prepare("SELECT COUNT(*) FROM companies WHERE active = 1").pluck().get();
+    const u = db.prepare("SELECT COUNT(*) FROM unresolved_companies WHERE name NOT IN (SELECT name FROM companies)").pluck().get();
+    console.table(n);
+    console.log(`total active companies: ${total} | unresolved names: ${u}`);
+    break;
+  }
+  case "add-url": {
+    // e.g. add-url https://acme.wd5.myworkdayjobs.com/External --name "Acme" --hot
+    const name = args.includes("--name") ? args[args.indexOf("--name") + 1] : undefined;
+    const tier = args.includes("--hot") ? 1 : 2;
+    for (const url of args.filter((a) => /^https?:\/\//.test(a))) ctx.enqueue("resolve_url", { url, name, tier, source: "manual" });
+    await runtime.drain();
     break;
   }
   case "add-company": {

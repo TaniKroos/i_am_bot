@@ -1,8 +1,9 @@
 import type { Agent, AgentContext } from "../../core/agent.js";
 import { loadProfile } from "./profile.js";
-import { scorePosting } from "./scorer.js";
+import { resolveUrl } from "./resolve.js";
+import { isLocationPlaceholder, scorePosting, screenPosting } from "./scorer.js";
 import { fetchers } from "./sources/index.js";
-import type { Ats, Posting } from "./types.js";
+import { TemporarilyUnavailable, type Ats, type Posting } from "./types.js";
 
 /** Poll intervals by tier: hot companies every few minutes so we can apply early. */
 export const POLL_EVERY_MS: Record<number, number> = { 1: 3 * 60_000, 2: 30 * 60_000 };
@@ -10,7 +11,8 @@ export const POLL_EVERY_MS: Record<number, number> = { 1: 3 * 60_000, 2: 30 * 60
 const FIRST_POLL_MAX_AGE_MS = 21 * 24 * 3600_000;
 export const MATCH_THRESHOLD = 60;
 
-const ATS_ORDER: Ats[] = ["greenhouse", "lever", "ashby"];
+/** Careers systems that can be found from a company name alone (Workday/Oracle need a URL). */
+const NAME_RESOLVABLE: Ats[] = ["greenhouse", "lever", "ashby", "smartrecruiters", "workable"];
 
 export function tokenCandidates(name: string): string[] {
   const base = name.toLowerCase().trim();
@@ -29,7 +31,7 @@ function upsertPostings(ctx: AgentContext, postings: Posting[], firstPoll: boole
   );
   ctx.db.transaction(() => {
     for (const p of postings) {
-      const id = `${p.ats}:${p.boardToken}:${p.externalId}`;
+      const id = jobId(p.ats, p.boardToken, p.externalId);
       if (exists.get(id)) continue;
       const stale = firstPoll && (p.postedAt === null || now - p.postedAt > FIRST_POLL_MAX_AGE_MS);
       insert.run({ ...p, id, remote: p.remote ? 1 : 0, now, status: stale ? "baseline" : "new" });
@@ -37,6 +39,34 @@ function upsertPostings(ctx: AgentContext, postings: Posting[], firstPoll: boole
     }
   })();
   return fresh;
+}
+
+const jobId = (ats: string, token: string, externalId: string) => `${ats}:${token}:${externalId}`;
+
+function addCompany(ctx: AgentContext, c: { ats: Ats; token: string; name: string; tier: number; source: string; jobCount?: number }) {
+  ctx.db
+    .prepare(
+      `INSERT INTO companies (ats, token, name, tier, source, job_count, added_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(ats, token) DO UPDATE SET tier = MIN(tier, excluded.tier), active = 1`,
+    )
+    .run(c.ats, c.token, c.name, c.tier, c.source, c.jobCount ?? null, Date.now());
+  ctx.log("company_added", c);
+}
+
+function rowToPosting(row: any): Posting {
+  return {
+    ats: row.ats,
+    boardToken: row.board_token,
+    companyName: row.company_name,
+    externalId: row.external_id,
+    title: row.title,
+    location: row.location ?? "",
+    remote: !!row.remote,
+    url: row.url,
+    applyUrl: row.apply_url,
+    postedAt: row.posted_at,
+    description: row.description ?? "",
+  };
 }
 
 export const jobsAgent: Agent = {
@@ -90,6 +120,14 @@ export const jobsAgent: Agent = {
         CREATE INDEX jobs_company ON jobs(board_token, status);
       `,
     },
+    {
+      id: "jobs:002",
+      sql: `
+        -- Set once a board's first successful poll has stored its existing postings.
+        ALTER TABLE companies ADD COLUMN baseline_done INTEGER NOT NULL DEFAULT 0;
+        UPDATE companies SET baseline_done = 1 WHERE last_polled_at IS NOT NULL AND last_error IS NULL;
+      `,
+    },
   ],
 
   automations: [
@@ -111,78 +149,95 @@ export const jobsAgent: Agent = {
     },
   ],
 
-  concurrency: { poll_board: 8, resolve_company: 4, score_job: 4 },
+  concurrency: { poll_board: 8, resolve_company: 6, resolve_url: 4, score_job: 6 },
 
   handlers: {
-    /** Find which careers system a company uses and add it to the directory. */
+    /** Find which careers system a company uses from its name (Greenhouse/Lever/Ashby/SmartRecruiters). */
     async resolve_company({ name, tier = 2, source = "manual" }: { name: string; tier?: number; source?: string }, ctx) {
-      for (const ats of ATS_ORDER) {
+      const probe = { isKnown: () => false, since: 0, firstPoll: false };
+      for (const ats of NAME_RESOLVABLE) {
         for (const token of tokenCandidates(name)) {
-          const board = await fetchers[ats].fetchBoard(token).catch(() => null);
+          const board = await fetchers[ats].fetchBoard(token, probe).catch(() => null);
           if (!board) continue;
-          ctx.db
-            .prepare(
-              `INSERT INTO companies (ats, token, name, tier, source, job_count, added_at) VALUES (?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(ats, token) DO UPDATE SET tier = MIN(tier, excluded.tier)`,
-            )
-            .run(ats, token, board.companyName === token ? name : board.companyName, tier, source, board.postings.length, Date.now());
-          ctx.log("company_added", { name, ats, token, jobs: board.postings.length });
+          addCompany(ctx, { ats, token, name, tier, source, jobCount: board.postings.length });
           return;
         }
       }
       ctx.db.prepare("INSERT OR REPLACE INTO unresolved_companies (name, tried_at, source) VALUES (?, ?, ?)").run(name, Date.now(), source);
     },
 
+    /** Add a board from any job/careers URL (how Workday/Oracle companies, X posts and alert emails get in). */
+    async resolve_url({ url, name, tier = 2, source = "manual" }: { url: string; name?: string; tier?: number; source?: string }, ctx) {
+      const ref = await resolveUrl(url);
+      if (!ref) {
+        ctx.db.prepare("INSERT OR REPLACE INTO unresolved_companies (name, tried_at, source) VALUES (?, ?, ?)").run(name ?? url, Date.now(), source);
+        return;
+      }
+      addCompany(ctx, { ...ref, name: name ?? ref.token.split("|")[0], tier, source });
+    },
+
     async poll_board({ ats, token }: { ats: Ats; token: string }, ctx) {
-      const firstPoll = !ctx.db.prepare("SELECT last_polled_at FROM companies WHERE ats = ? AND token = ?").pluck().get(ats, token);
+      const company = ctx.db.prepare("SELECT name, baseline_done FROM companies WHERE ats = ? AND token = ?").get(ats, token) as
+        | { name: string; baseline_done: number }
+        | undefined;
+      if (!company) return;
+      const firstPoll = !company.baseline_done;
       const markPolled = (error: string | null, jobCount?: number) =>
         ctx.db
-          .prepare("UPDATE companies SET last_polled_at = ?, last_error = ?, job_count = COALESCE(?, job_count) WHERE ats = ? AND token = ?")
-          .run(Date.now(), error, jobCount ?? null, ats, token);
+          .prepare(
+            `UPDATE companies SET last_polled_at = ?, last_error = ?, job_count = COALESCE(?, job_count),
+               baseline_done = baseline_done OR ? WHERE ats = ? AND token = ?`,
+          )
+          .run(Date.now(), error, jobCount ?? null, error ? 0 : 1, ats, token);
+      const known = ctx.db.prepare("SELECT 1 FROM jobs WHERE id = ?").pluck();
       try {
-        const board = await fetchers[ats].fetchBoard(token);
+        const board = await fetchers[ats].fetchBoard(token, {
+          isKnown: (externalId) => Boolean(known.get(jobId(ats, token, externalId))),
+          since: Date.now() - FIRST_POLL_MAX_AGE_MS,
+          firstPoll,
+        });
         if (!board) {
           ctx.db.prepare("UPDATE companies SET active = 0 WHERE ats = ? AND token = ?").run(ats, token);
           markPolled("board not found");
           return;
         }
-        const name = ctx.db.prepare("SELECT name FROM companies WHERE ats = ? AND token = ?").pluck().get(ats, token) as string;
-        const fresh = upsertPostings(ctx, board.postings.map((p) => ({ ...p, companyName: name ?? p.companyName })), firstPoll);
+        const fresh = upsertPostings(ctx, board.postings.map((p) => ({ ...p, companyName: company.name })), firstPoll);
         markPolled(null, board.postings.length);
-        for (const p of fresh) {
-          ctx.enqueue("score_job", { id: `${p.ats}:${p.boardToken}:${p.externalId}` }, { priority: 10 });
-        }
+        for (const p of fresh) ctx.enqueue("score_job", { id: jobId(p.ats, p.boardToken, p.externalId) }, { priority: 10 });
         if (fresh.length) ctx.log("new_postings", { ats, token, count: fresh.length });
       } catch (e) {
+        // Maintenance windows (Workday weekends) are expected: note it and try again on the next cycle.
         markPolled(String(e));
-        throw e;
+        if (!(e instanceof TemporarilyUnavailable)) throw e;
       }
     },
 
     async score_job({ id }: { id: string }, ctx) {
       const row = ctx.db.prepare("SELECT * FROM jobs WHERE id = ?").get(id) as any;
       if (!row || row.status !== "new") return;
-      const posting: Posting = {
-        ats: row.ats,
-        boardToken: row.board_token,
-        companyName: row.company_name,
-        externalId: row.external_id,
-        title: row.title,
-        location: row.location ?? "",
-        remote: !!row.remote,
-        url: row.url,
-        applyUrl: row.apply_url,
-        postedAt: row.posted_at,
-        description: row.description ?? "",
+      const profile = loadProfile();
+      let posting = rowToPosting(row);
+      const save = (fields: Record<string, unknown>) => {
+        const cols = Object.keys(fields);
+        ctx.db.prepare(`UPDATE jobs SET ${cols.map((c) => `${c} = @${c}`).join(", ")}, updated_at = @now WHERE id = @id`).run({ ...fields, now: Date.now(), id });
       };
-      const s = scorePosting(posting, loadProfile());
-      const status = s.rejected ? "rejected" : s.score >= MATCH_THRESHOLD ? "matched" : "rejected";
-      const reasons = s.rejected ? [s.rejected] : s.score >= MATCH_THRESHOLD ? s.reasons : [...s.reasons, `score ${s.score} < ${MATCH_THRESHOLD}`];
-      ctx.db
-        .prepare("UPDATE jobs SET score = ?, min_years = ?, reasons = ?, status = ?, updated_at = ? WHERE id = ?")
-        .run(s.score, s.minYears, JSON.stringify(reasons), status, Date.now(), id);
-      if (status === "matched") {
-        ctx.notify(`New match (${s.score}): ${row.title} @ ${row.company_name} — ${row.location}`, { id, url: row.url });
+
+      // Big boards list without descriptions: screen on title/location first, fetch details only for survivors.
+      const screened = screenPosting(posting, profile);
+      if (screened) return save({ status: "rejected", score: 0, reasons: JSON.stringify([screened]) });
+      const fetcher = fetchers[posting.ats];
+      if ((!posting.description || isLocationPlaceholder(posting.location)) && fetcher.fetchDetails) {
+        const details = await fetcher.fetchDetails(posting.boardToken, posting.externalId);
+        posting = { ...posting, description: details.description, location: details.location ?? posting.location };
+        save({ description: posting.description, location: posting.location });
+      }
+
+      const s = scorePosting(posting, profile);
+      const matched = !s.rejected && s.score >= MATCH_THRESHOLD;
+      const reasons = s.rejected ? [s.rejected] : matched ? s.reasons : [...s.reasons, `score ${s.score} < ${MATCH_THRESHOLD}`];
+      save({ score: s.score, min_years: s.minYears, reasons: JSON.stringify(reasons), status: matched ? "matched" : "rejected" });
+      if (matched) {
+        ctx.notify(`New match (${s.score}): ${row.title} @ ${row.company_name} — ${posting.location}`, { id, url: row.url });
         // Next stage (tailor resume → fill → submit) plugs in here.
       }
     },

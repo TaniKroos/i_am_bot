@@ -2,6 +2,16 @@ import { USER_AGENT } from "../../../core/config.js";
 
 export class NotFound extends Error {}
 
+const lastCall = new Map<string, Promise<void>>();
+
+/** Space out calls that share a key (e.g. one careers system) so we stay under its rate limits. */
+export function throttle(key: string, minIntervalMs: number): Promise<void> {
+  const prev = lastCall.get(key) ?? Promise.resolve();
+  const next = prev.then(() => new Promise<void>((r) => setTimeout(r, minIntervalMs)));
+  lastCall.set(key, next);
+  return prev;
+}
+
 export async function getJson<T>(url: string, timeoutMs = 20_000): Promise<T> {
   const res = await fetch(url, {
     headers: { "user-agent": USER_AGENT, accept: "application/json" },

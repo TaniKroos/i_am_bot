@@ -50,6 +50,21 @@ function locationFit(p: Posting): Score["locationFit"] {
   return "no";
 }
 
+export const isLocationPlaceholder = (loc: string) => /^\d+\s+locations?$/i.test(loc.trim());
+
+/** Cheap title + location check that needs no description. Returns the rejection reason, or null to continue. */
+export function screenPosting(p: Posting, profile: Profile): string | null {
+  const t = profile.targeting;
+  const title = p.title.toLowerCase();
+  const excluded = t.titles_exclude.find((x) => wordMatch(title, x)) ?? (/\blead\b/.test(title) ? "lead" : undefined);
+  if (excluded) return `title excludes "${excluded}"`;
+  if (!t.titles_include.some((x) => wordMatch(title, x)) && !/\bengineer\b|\bdeveloper\b/.test(title)) return "title not a target role";
+  // Workday lists multi-city jobs as "3 Locations": decide after the details fetch fills in the real ones.
+  if (isLocationPlaceholder(p.location)) return null;
+  if (locationFit(p) === "no") return `location "${p.location || "unknown"}" not India/remote-India`;
+  return null;
+}
+
 export function scorePosting(p: Posting, profile: Profile): Score {
   const t = profile.targeting;
   const title = p.title.toLowerCase();
@@ -62,13 +77,10 @@ export function scorePosting(p: Posting, profile: Profile): Score {
     reasons,
   });
 
-  const excluded = t.titles_exclude.find((x) => wordMatch(title, x)) ?? (/\blead\b/.test(title) ? "lead" : undefined);
-  if (excluded) return result(`title excludes "${excluded}"`);
+  const screened = screenPosting(p, profile);
+  if (screened) return result(screened);
   const included = t.titles_include.find((x) => wordMatch(title, x));
-  if (!included && !/\bengineer\b|\bdeveloper\b/.test(title)) return result("title not a target role");
-
   const loc = locationFit(p);
-  if (loc === "no") return result(`location "${p.location || "unknown"}" not India/remote-India`, 0, null, loc);
 
   const minYears = minYearsRequired(p.description);
   if (minYears !== null && minYears > t.max_min_years_required) return result(`needs ${minYears}+ years`, 0, minYears, loc);
@@ -90,6 +102,8 @@ export function scorePosting(p: Posting, profile: Profile): Score {
   const text = `${p.title}\n${p.description}`;
   const strong = t.skills.strong.filter((s) => wordMatch(text, s.toLowerCase()));
   const familiar = t.skills.familiar.filter((s) => wordMatch(text, s.toLowerCase()));
+  // A title like "X Engineer" only counts as software work if the JD leans on the owner's core skills.
+  if (!included && strong.length < 3) return result(`generic title with only ${strong.length} core skills`, 0, minYears, loc);
   const skillPoints = Math.min(25, strong.length * 4 + familiar.length * 2);
   score += skillPoints;
   if (strong.length) reasons.push(`skills: ${strong.slice(0, 6).join(", ")}`);
