@@ -88,6 +88,8 @@ export function answerField(field: FormField, ctx: AnswerContext): Answer {
   // 2) Voluntary demographic questions: always decline.
   if (field.group === "eeoc" || /\b(gender|race|ethnic|hispanic|latino|veteran|disability|sexual orientation|pronoun|transgender)\b/i.test(L)) {
     const decline = field.options?.find((o) => DECLINE.test(o.label));
+    if (decline && !field.required) return { kind: "value", value: decline.value, source: "eeo_decline", note: decline.label };
+    if (/\bgender\b/.test(L) && f.gender) return value(field, f.gender, "profile", "owner answers when required");
     if (decline) return { kind: "value", value: decline.value, source: "eeo_decline", note: decline.label };
     return field.required ? { kind: "ask", question: label } : { kind: "skip", reason: "voluntary demographic question" };
   }
