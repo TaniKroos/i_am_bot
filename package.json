@@ -1,0 +1,29 @@
+{
+  "name": "grokbot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Personal Grok-Bot-style agent platform. First agent: jobs.",
+  "scripts": {
+    "bot": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20.19"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "yaml": "^2.9.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^20.19.43",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "allowScripts": {
+    "better-sqlite3@11.10.0": true,
+    "esbuild@0.28.2": true
+  }
+}

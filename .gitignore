@@ -1,0 +1,7 @@
+node_modules/
+# Private: never commit personal data, databases, browser profiles or secrets
+data/
+profile/
+.env
+*.db
+*.db-*
