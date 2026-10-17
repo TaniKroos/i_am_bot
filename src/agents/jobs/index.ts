@@ -3,6 +3,7 @@ import { loadProfile } from "./profile.js";
 import { resolveUrl } from "./resolve.js";
 import { isLocationPlaceholder, scorePosting, screenPosting } from "./scorer.js";
 import { fetchers } from "./sources/index.js";
+import { prepareApplication, submitApplication, SUBMITTABLE } from "./pipeline.js";
 import { TemporarilyUnavailable, type Ats, type Posting } from "./types.js";
 
 /** Poll intervals by tier: hot companies every few minutes so we can apply early. */
@@ -128,9 +129,56 @@ export const jobsAgent: Agent = {
         UPDATE companies SET baseline_done = 1 WHERE last_polled_at IS NOT NULL AND last_error IS NULL;
       `,
     },
+    {
+      id: "jobs:003",
+      sql: `
+        CREATE TABLE applications (
+          job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+          -- queued | tailoring | ready | submitting | submitted | needs_user | skipped | waiting_adapter | failed
+          status TEXT NOT NULL,
+          dir TEXT,
+          resume_pdf TEXT,
+          resume_verdict TEXT,
+          truth TEXT,
+          blockers TEXT,
+          fill TEXT,
+          outcome TEXT,
+          error TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          submitted_at INTEGER
+        );
+        CREATE INDEX applications_status ON applications(status, updated_at);
+      `,
+    },
+    {
+      id: "jobs:004",
+      sql: `
+        ALTER TABLE applications ADD COLUMN resume_tier INTEGER;      -- 0 ready-made, 1 Sonnet, 2 Opus
+        ALTER TABLE applications ADD COLUMN resume_variant TEXT;      -- base / ai-llm / backend / fullstack / platform
+        ALTER TABLE applications ADD COLUMN resume_gap REAL;
+      `,
+    },
   ],
 
   automations: [
+    {
+      // Matched jobs with no application yet (backlog, or a newly supported careers system) enter the pipeline.
+      id: "feed-pipeline",
+      everyMs: 5 * 60_000,
+      run(ctx) {
+        const rows = ctx.db
+          .prepare(
+            `SELECT j.id, j.ats FROM jobs j LEFT JOIN applications a ON a.job_id = j.id
+             WHERE j.status = 'matched' AND (a.job_id IS NULL OR a.status = 'waiting_adapter')
+             ORDER BY COALESCE(j.posted_at, j.first_seen_at) DESC LIMIT 50`,
+          )
+          .all() as { id: string; ats: string }[];
+        for (const r of rows.filter((r) => SUBMITTABLE.has(r.ats))) {
+          ctx.enqueue("prepare_application", { jobId: r.id }, { priority: 15, dedupeKey: `prepare:${r.id}`, maxAttempts: 2 });
+        }
+      },
+    },
     {
       id: "schedule-polls",
       everyMs: 30_000,
@@ -149,9 +197,13 @@ export const jobsAgent: Agent = {
     },
   ],
 
-  concurrency: { poll_board: 8, resolve_company: 6, resolve_url: 4, score_job: 6 },
+  // One resume at a time (Claude Pro usage) and one browser submission at a time.
+  concurrency: { poll_board: 8, resolve_company: 6, resolve_url: 4, score_job: 6, prepare_application: 1, submit_application: 1 },
 
   handlers: {
+    prepare_application: prepareApplication,
+    submit_application: submitApplication,
+
     /** Find which careers system a company uses from its name (Greenhouse/Lever/Ashby/SmartRecruiters). */
     async resolve_company({ name, tier = 2, source = "manual" }: { name: string; tier?: number; source?: string }, ctx) {
       const probe = { isKnown: () => false, since: 0, firstPoll: false };
@@ -238,7 +290,7 @@ export const jobsAgent: Agent = {
       save({ score: s.score, min_years: s.minYears, reasons: JSON.stringify(reasons), status: matched ? "matched" : "rejected" });
       if (matched) {
         ctx.notify(`New match (${s.score}): ${row.title} @ ${row.company_name} — ${posting.location}`, { id, url: row.url });
-        // Next stage (tailor resume → fill → submit) plugs in here.
+        ctx.enqueue("prepare_application", { jobId: id }, { priority: 15, dedupeKey: `prepare:${id}`, maxAttempts: 2 });
       }
     },
   },

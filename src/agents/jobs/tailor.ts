@@ -19,7 +19,6 @@ const ALLOWED_TOOLS = [
   "Edit",
   "Glob",
   "Grep",
-  "Skill",
   "Bash(pdflatex:*)",
   "Bash(pdfinfo:*)",
   "Bash(pdftoppm:*)",
@@ -81,6 +80,9 @@ You are running **headless inside grokBot**. Nobody can answer questions during 
    Respect \`do_not_claim\` and \`do_not_list_terms\` in facts.md absolutely.
    - Keep each number with the system it belongs to (e.g. "800+ engineers" is the MCP skills platform, not the RAG pipeline).
    - Keep each project's stack exactly as listed in base_resume.tex; don't swap technologies between projects.
+     In the summary, a list of technologies for the side projects must come only from those projects' stack lines
+     (e.g. never "side projects on ... Docker" if a side project doesn't use Docker; keep the base wording when unsure).
+   - Copy every number exactly, including qualifiers: never add or drop "+", "%", "x", "K" or "sub-".
    - Don't add scope adjectives the sources don't support ("existing", "enterprise-wide", "large-scale", "ML").
    - Keep the **section order of base_resume.tex** (Education stays near the top); reorder bullets, projects and skills freely.
 4. **Total experience is ${loadProfile().facts.total_experience_years} years.** Never claim more (no "2+ years", no "senior").
@@ -107,27 +109,50 @@ export interface TailorOutcome {
   verdict: "ready" | "review" | "blocked";
 }
 
-export async function tailorResume(
-  db: DB,
-  jobId: string,
-  opts: { model?: string; onEvent?: (e: ClaudeCodeEvent) => void } = {},
-): Promise<TailorOutcome> {
-  if (!existsSync(BASE_TEX)) throw new Error(`Base resume missing: put your LaTeX source at ${BASE_TEX}`);
+interface BuildOpts {
+  model?: string;
+  bannedTerms?: string[];
+  onEvent?: (e: ClaudeCodeEvent) => void;
+}
+
+/** Tailor for one job (tier 1/2). */
+export async function tailorResume(db: DB, jobId: string, opts: BuildOpts = {}): Promise<TailorOutcome> {
   const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId) as any;
   if (!job) throw new Error(`No job ${jobId}`);
-
   const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-  const dir = join(DATA_DIR, "applications", `${date}-${slug(job.company_name)}-${slug(job.title)}${opts.model ? `-${opts.model}` : ""}`);
-  const fileStem = `Tanish_Saini_${slug(job.company_name)}_${slug(job.title).slice(0, 30)}_Resume`;
-  mkdirSync(dir, { recursive: true });
+  return buildResume({
+    dir: join(DATA_DIR, "applications", `${date}-${slug(job.company_name)}-${slug(job.title)}${opts.model ? `-${opts.model}` : ""}`),
+    fileStem: `Tanish_Saini_${slug(job.company_name)}_${slug(job.title).slice(0, 30)}_Resume`,
+    target: { company: job.company_name, title: job.title },
+    jdMarkdown: `# ${job.title}\n\n- Company: ${job.company_name}\n- Location: ${job.location}\n- URL: ${job.url}\n\n## Description\n\n${job.description ?? ""}\n`,
+    ...opts,
+  });
+}
 
-  writeFileSync(
-    join(dir, "jd.md"),
-    `# ${job.title}\n\n- Company: ${job.company_name}\n- Location: ${job.location}\n- URL: ${job.url}\n\n## Description\n\n${job.description ?? ""}\n`,
-  );
+/** A reusable role variant (tier 0), built once from a role brief instead of a single JD. */
+export async function buildVariant(name: string, brief: string, opts: BuildOpts = {}): Promise<TailorOutcome> {
+  return buildResume({
+    dir: join(DATA_DIR, "resume-variants", name),
+    fileStem: `Tanish_Saini_Resume_${slug(name)}`,
+    target: { company: "(any company)", title: `${name} roles` },
+    jdMarkdown: `# Role family: ${name}\n\nThis is not one job: it describes a family of roles. Build a resume that fits most of them.\n\n${brief}\n`,
+    ...opts,
+  });
+}
+
+async function buildResume(o: BuildOpts & { dir: string; fileStem: string; target: { company: string; title: string }; jdMarkdown: string }): Promise<TailorOutcome> {
+  if (!existsSync(BASE_TEX)) throw new Error(`Base resume missing: put your LaTeX source at ${BASE_TEX}`);
+  const { dir, fileStem, onEvent } = o;
+  const opts = o;
+  const job = { company_name: o.target.company, title: o.target.title };
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "jd.md"), o.jdMarkdown);
   cpSync(BASE_TEX, join(dir, "base_resume.tex"));
   writeFileSync(join(dir, "facts.md"), factsMarkdown());
-  writeFileSync(join(dir, "CLAUDE.md"), instructions({ company: job.company_name, title: job.title }, fileStem));
+  const banned = opts.bannedTerms?.length
+    ? `\n## Redo\nA previous attempt used words that aren't in the owner's sources. Do not use any of these anywhere: ${opts.bannedTerms.map((t) => `"${t}"`).join(", ")}.\n`
+    : "";
+  writeFileSync(join(dir, "CLAUDE.md"), instructions({ company: job.company_name, title: job.title }, fileStem) + banned);
   cpSync(findResumeSkill(), join(dir, ".claude", "skills", "resume-tailoring"), { recursive: true });
 
   const run = await runClaudeCode({
@@ -138,7 +163,7 @@ export async function tailorResume(
     maxTurns: 80,
     timeoutMs: 30 * 60_000,
     model: opts.model,
-    onEvent: opts.onEvent,
+    onEvent,
   });
 
   // Independent verification: don't take the session's word for it.

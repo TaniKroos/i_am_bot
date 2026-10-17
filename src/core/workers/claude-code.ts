@@ -66,6 +66,11 @@ export function runClaudeCode(run: ClaudeCodeRun): Promise<ClaudeCodeResult> {
     run.allowedTools.join(","),
     "--max-turns",
     String(run.maxTurns ?? 60),
+    // Load only what the job needs: no MCP servers or connectors, and only the built-in tools it's allowed.
+    // Cuts the fixed context resent every turn from ~40K to ~8K tokens.
+    "--strict-mcp-config",
+    "--tools",
+    [...new Set(run.allowedTools.map((t) => t.replace(/\(.*$/, "")))].join(","),
   ];
   if (run.model) args.push("--model", run.model);
 

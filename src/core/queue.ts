@@ -75,6 +75,13 @@ export function fail(task: Task, error: string): void {
   }
 }
 
+/** Put a task back for later without counting the attempt (paused, rate-limited, capped). */
+export function defer(task: Task, delayMs: number, reason: string): void {
+  getDb()
+    .prepare("UPDATE tasks SET status = 'queued', attempts = attempts - 1, last_error = ?, run_at = ?, updated_at = ? WHERE id = ?")
+    .run(reason, Date.now() + delayMs, Date.now(), task.id);
+}
+
 /** Tasks left 'running' by a crashed process go back to the queue. */
 export function recoverStale(olderThanMs = 10 * 60_000): number {
   return getDb()

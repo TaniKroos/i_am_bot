@@ -57,6 +57,23 @@ export async function notifyOwner(text: string, buttons: Button[][] = []): Promi
   });
 }
 
+/** Message the owner with a screenshot (sent as a document so long pages aren't downscaled). */
+export async function notifyOwnerFile(path: string, caption: string): Promise<void> {
+  const chat = ownerChatId();
+  if (!chat) {
+    console.log(`[telegram not paired] ${caption}`);
+    return;
+  }
+  const { readFileSync } = await import("node:fs");
+  const form = new FormData();
+  form.set("chat_id", chat);
+  form.set("caption", caption.slice(0, 1000));
+  form.set("document", new Blob([readFileSync(path)]), path.split("/").pop());
+  const res = await fetch(`${API()}/sendDocument`, { method: "POST", body: form, signal: AbortSignal.timeout(60_000) });
+  const data = (await res.json()) as { ok: boolean; description?: string };
+  if (!data.ok) throw new Error(`telegram sendDocument: ${data.description}`);
+}
+
 /** Start pairing: returns a code the owner sends as "/start <code>" within 10 minutes. */
 export function beginPairing(): string {
   const code = String(randomInt(100000, 1000000));

@@ -171,6 +171,63 @@ switch (cmd) {
     if (!args.includes("--keep-open")) await closeBotBrowser();
     break;
   }
+  case "apply": {
+    // Run the full pipeline for one matched job now. --dry-run fills but never submits.
+    const { settings, setSetting } = await import("./agents/jobs/pipeline.js");
+    const q = args.filter((a) => !a.startsWith("--")).join(" ");
+    const job = db
+      .prepare(`SELECT id, title, company_name FROM jobs WHERE id = ? OR (status = 'matched' AND (title || ' ' || company_name) LIKE ?) ORDER BY score DESC LIMIT 1`)
+      .get(q, `%${q}%`) as { id: string; title: string; company_name: string } | undefined;
+    if (!job) throw new Error(`no matched job for "${q}"`);
+    const prevDry = settings(ctx).dry_run;
+    if (args.includes("--dry-run")) setSetting(ctx, "dry_run", 1);
+    console.log(`Applying: ${job.title} @ ${job.company_name}${settings(ctx).dry_run ? " (DRY RUN)" : ""}`);
+    ctx.enqueue("prepare_application", { jobId: job.id }, { priority: 50, dedupeKey: `prepare:${job.id}`, maxAttempts: 1 });
+    await runtime.drain();
+    setSetting(ctx, "dry_run", prevDry);
+    const a = db.prepare("SELECT status, resume_verdict, resume_pdf, truth, fill, outcome, error, dir FROM applications WHERE job_id = ?").get(job.id);
+    console.log(JSON.stringify(a, null, 2));
+    const { closeBotBrowser } = await import("./agents/jobs/apply/browser.js");
+    await closeBotBrowser();
+    break;
+  }
+  case "gmail-login": {
+    const { gmailLogin } = await import("./core/google/auth.js");
+    const r = await gmailLogin();
+    console.log(`✅ Gmail connected: ${r.email} (scope: ${r.scope})`);
+    break;
+  }
+  case "gmail-check": {
+    const { gmailProfile } = await import("./core/google/auth.js");
+    const p = await gmailProfile();
+    console.log(`✅ Gmail read-only works: ${p.emailAddress}, ${p.messagesTotal} messages`);
+    break;
+  }
+  case "variants": {
+    // variants build [names…] [--model opus] | variants list | variants approve <name…>
+    const v = await import("./agents/jobs/variants.js");
+    const [sub, ...rest] = args;
+    if (sub === "build") {
+      const { buildVariant } = await import("./agents/jobs/tailor.js");
+      const tg = await import("./core/channels/telegram.js");
+      const model = rest.includes("--model") ? rest[rest.indexOf("--model") + 1] : "sonnet";
+      const names = rest.filter((a, i) => !a.startsWith("--") && rest[i - 1] !== "--model");
+      for (const name of names.length ? names : Object.keys(v.VARIANT_BRIEFS)) {
+        console.log(`building ${name} (${model})…`);
+        let out = await buildVariant(name, v.VARIANT_BRIEFS[name], { model });
+        if (out.verdict === "review") out = await buildVariant(name, v.VARIANT_BRIEFS[name], { model, bannedTerms: out.truth?.borrowedTerms });
+        const tex = out.pdf?.replace(/\.pdf$/, ".tex") ?? "";
+        v.saveVariant({ name, pdf: out.pdf ?? "", tex, verdict: out.verdict, approved: false, builtAt: Date.now() });
+        console.log(`  ${name}: ${out.verdict.toUpperCase()} · ${out.run.turns} turns · ${Math.round(out.run.durationMs / 1000)}s · $${out.run.costUsd?.toFixed(2)} eq · truth ${JSON.stringify(out.truth)}`);
+        if (out.pdf) await tg.notifyOwnerFile(out.pdf, `📄 Resume variant "${name}" (${out.verdict}). Review it once; approve on the Mac with: npm run bot -- variants approve ${name}`).catch(() => undefined);
+      }
+    } else if (sub === "approve") {
+      for (const name of rest) console.log(`approved ${v.approveVariant(name).name}`);
+    } else {
+      for (const r of v.loadVariants()) console.log(`${r.approved ? "✅" : "⏳"} ${r.name.padEnd(10)} ${r.verdict.padEnd(7)} ${r.pdf}`);
+    }
+    break;
+  }
   case "pair": {
     const tg = await import("./core/channels/telegram.js");
     if (tg.ownerChatId()) {
@@ -200,8 +257,44 @@ switch (cmd) {
     break;
   }
   case "run": {
-    console.log("grokBot running. Ctrl+C to stop.");
+    const tg = await import("./core/channels/telegram.js");
+    const { settings, setSetting } = await import("./agents/jobs/pipeline.js");
+    if (args.includes("--dry-run")) setSetting(ctx, "dry_run", 1);
+    console.log(`grokBot running${settings(ctx).dry_run ? " (DRY RUN: fills but never submits)" : ""}. Ctrl+C to stop.`);
     runtime.start();
+    const count = (sql: string, ...p: unknown[]) => db.prepare(sql).pluck().get(...p) as number;
+    void tg.pollTelegram({
+      commands: {
+        status: async (_a, reply) => {
+          const s = settings(ctx);
+          const dayStart = new Date().setHours(0, 0, 0, 0);
+          const by = db.prepare("SELECT status, COUNT(*) n FROM applications GROUP BY status").all() as { status: string; n: number }[];
+          await reply(
+            [
+              `${s.paused ? "⏸ PAUSED" : s.dry_run ? "🧪 DRY RUN" : "▶️ Running"}`,
+              `Applied today: ${count("SELECT COUNT(*) FROM applications WHERE status='submitted' AND submitted_at >= ?", dayStart)} / ${s.daily_cap}`,
+              `Applied total: ${count("SELECT COUNT(*) FROM applications WHERE status='submitted'")}`,
+              `Matches waiting: ${count("SELECT COUNT(*) FROM jobs WHERE status='matched'")}`,
+              ...by.map((b) => `• ${b.status}: ${b.n}`),
+            ].join("\n"),
+          );
+        },
+        queue: async (_a, reply) => {
+          const rows = db
+            .prepare(`SELECT j.title, j.company_name, a.error FROM applications a JOIN jobs j ON j.id = a.job_id WHERE a.status = 'needs_user' ORDER BY a.updated_at DESC LIMIT 10`)
+            .all() as any[];
+          await reply(rows.length ? rows.map((r) => `• ${r.title} @ ${r.company_name}\n  ${String(r.error).slice(0, 160)}`).join("\n") : "Nothing needs you 🎉");
+        },
+        pause: async (_a, reply) => (setSetting(ctx, "paused", 1), reply("⏸ Paused. Nothing will be submitted until /resume.")),
+        resume: async (_a, reply) => (setSetting(ctx, "paused", 0), reply("▶️ Resumed.")),
+        dryrun: async (a, reply) => (setSetting(ctx, "dry_run", a === "off" ? 0 : 1), reply(a === "off" ? "Live: applications will be submitted." : "🧪 Dry run: fills and screenshots, never submits.")),
+        cap: async (a, reply) => {
+          const n = Number(a);
+          if (n > 0) setSetting(ctx, "daily_cap", n);
+          await reply(`Daily cap: ${settings(ctx).daily_cap}`);
+        },
+      },
+    });
     process.on("SIGINT", () => (runtime.stop(), process.exit(0)));
     break;
   }

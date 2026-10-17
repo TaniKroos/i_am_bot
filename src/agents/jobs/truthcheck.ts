@@ -26,7 +26,7 @@ const ALIASES: Record<string, string> = {
   nosql: "nosql",
 };
 
-function texToText(tex: string): string {
+export function texToText(tex: string): string {
   return tex
     .replace(/^[\s\S]*?\\begin\{document\}/, "")
     .replace(/\\end\{document\}[\s\S]*$/, "")
@@ -39,14 +39,14 @@ function texToText(tex: string): string {
     .replace(/--/g, "–");
 }
 
-const norm = (t: string) => {
+export const norm = (t: string) => {
   const l = t.toLowerCase().replace(/[.,;:)(]+$/g, "").replace(/^[(]+/, "");
   const a = ALIASES[l] ?? l;
   return a.length > 3 && a.endsWith("s") && !a.endsWith("ss") ? a.slice(0, -1) : a;
 };
 
 /** Tokens that look like technologies: acronyms, CamelCase, dotted/symbol names, or capitalised mid-sentence words. */
-function techTokens(text: string): Set<string> {
+export function techTokens(text: string): Set<string> {
   const out = new Set<string>();
   for (const m of text.matchAll(/(?<=^|[\s,(/|–—-])([A-Za-z][A-Za-z0-9.+#/-]*[A-Za-z0-9+#])/g)) {
     const t = m[1];
@@ -66,9 +66,9 @@ export function truthCheck(input: { tailoredTex: string; baseTex: string; factsT
   const out = texToText(input.tailoredTex);
   const sources = `${texToText(input.baseTex)}\n${input.factsText}`;
 
+  // Exact match including qualifiers: "10,000+" is a different claim from "10,000".
   const known = numbers(sources);
-  const knownBare = new Set([...known].map((n) => n.replace(/[^\d.]/g, "")));
-  const unknownNumbers = [...numbers(out)].filter((n) => !known.has(n) && !knownBare.has(n.replace(/[^\d.]/g, "")));
+  const unknownNumbers = [...numbers(out)].filter((n) => !known.has(n));
 
   const sourceTerms = new Set([...techTokens(sources), ...[...sources.toLowerCase().matchAll(/[a-z0-9.#+/-]+/g)].map((m) => norm(m[0]))]);
   const jdTerms = techTokens(input.jdText);

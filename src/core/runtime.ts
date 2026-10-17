@@ -1,6 +1,13 @@
 import type { Agent, AgentContext } from "./agent.js";
 import { getDb, logEvent, migrate } from "./db.js";
-import { claim, complete, enqueue, fail, recoverStale, type Task } from "./queue.js";
+import { claim, complete, defer, enqueue, fail, recoverStale, type Task } from "./queue.js";
+
+/** Throw from a handler to retry later without using up an attempt. */
+export class Deferred extends Error {
+  constructor(message: string, readonly delayMs = 15 * 60_000) {
+    super(message);
+  }
+}
 
 /** Runs agents: schedules their automations and executes queued tasks with per-kind concurrency. */
 export class Runtime {
@@ -85,6 +92,7 @@ export class Runtime {
       await agent.handlers[task.kind](task.payload, this.context(agent.id));
       complete(task.id);
     } catch (e) {
+      if (e instanceof Deferred) return defer(task, e.delayMs, e.message);
       fail(task, e instanceof Error ? e.message : String(e));
       logEvent(agent.id, "task_error", { kind: task.kind, id: task.id, error: String(e) });
     }
