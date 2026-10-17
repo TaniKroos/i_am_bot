@@ -32,14 +32,17 @@ const DECLINE = /(don.?t wish|do not wish|decline|prefer not|not to (answer|disc
 /** Pick the option that best matches a desired answer (exact → starts with → contains). */
 export function matchOption(options: FieldOption[], wanted: string | string[]): FieldOption | undefined {
   const list = Array.isArray(wanted) ? wanted : [wanted];
-  const expanded = list.flatMap((w) => (/^no$/i.test(w) ? [w, "never", "have not", "i have not", "not"] : /^yes$/i.test(w) ? [w, "i have", "i am", "i will"] : [w]));
-  for (const w of expanded) {
-    const lw = w.toLowerCase().trim();
-    const hit =
-      options.find((o) => o.label.toLowerCase().trim() === lw) ??
-      options.find((o) => o.label.toLowerCase().startsWith(lw)) ??
-      options.find((o) => o.label.toLowerCase().includes(lw));
-    if (hit) return hit;
+  const expanded = list
+    .flatMap((w) => (/^no$/i.test(w) ? [w, "never", "have not", "i have not", "not"] : /^yes$/i.test(w) ? [w, "i have", "i am", "i will"] : [w]))
+    .map((w) => w.toLowerCase().trim());
+  const labels = options.map((o) => ({ o, l: o.label.toLowerCase().trim() }));
+  const word = (w: string) => new RegExp(`(^|[^a-z0-9])${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^a-z0-9]|$)`);
+  // Strongest match type first across all candidates, so a later exact match beats an earlier partial one.
+  for (const test of [(l: string, w: string) => l === w, (l: string, w: string) => l.startsWith(w), (l: string, w: string) => word(w).test(l)]) {
+    for (const w of expanded) {
+      const hit = labels.find(({ l }) => test(l, w));
+      if (hit) return hit.o;
+    }
   }
   return undefined;
 }
@@ -77,10 +80,11 @@ export function answerField(field: FormField, ctx: AnswerContext): Answer {
   if (field.type === "hidden") return { kind: "skip", reason: "hidden field (set by the page)" };
 
   // 1) The owner's own answers always win.
+  const fill = (a: string | string[]) => (Array.isArray(a) ? a.map((x) => x.replace(/\{company\}/g, job.company)) : a.replace(/\{company\}/g, job.company));
   for (const e of ctx.bank) {
     if (new RegExp(e.match, "i").test(label)) {
-      const ans = value(field, e.answer, "answer_bank");
-      if (ans.kind === "ask" && e.fallback_options) return value(field, e.fallback_options, "answer_bank");
+      const ans = value(field, fill(e.answer), "answer_bank");
+      if (ans.kind !== "value" && e.fallback_options) return value(field, fill(e.fallback_options), "answer_bank");
       return ans;
     }
   }

@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -8,5 +8,8 @@ export const PROFILE_DIR = join(ROOT, "profile");
 export const DB_PATH = join(DATA_DIR, "grokbot.db");
 
 mkdirSync(DATA_DIR, { recursive: true });
+
+// Secrets (TELEGRAM_BOT_TOKEN, ...) live in .env, which is gitignored.
+if (existsSync(join(ROOT, ".env"))) process.loadEnvFile(join(ROOT, ".env"));
 
 export const USER_AGENT = "grokBot/0.1 (personal job search assistant)";

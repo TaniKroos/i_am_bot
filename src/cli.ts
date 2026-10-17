@@ -127,6 +127,71 @@ switch (cmd) {
     console.log(`\n${ready}/${jobs.length} ready to fill with no questions; ${n} distinct questions for you in profile/questions-pending.yaml`);
     break;
   }
+  case "fill": {
+    // DRY RUN: fill a matched job's application in the bot's Chrome and screenshot it. Never submits.
+    const { planApplication } = await import("./agents/jobs/apply/plan.js");
+    const { fillGreenhouse } = await import("./agents/jobs/apply/greenhouse-fill.js");
+    const { botBrowser, closeBotBrowser } = await import("./agents/jobs/apply/browser.js");
+    const { loadProfile } = await import("./agents/jobs/profile.js");
+    const { mkdirSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { DATA_DIR, PROFILE_DIR } = await import("./core/config.js");
+    const q = args.filter((a) => !a.startsWith("--")).join(" ");
+    const job = db
+      .prepare(`SELECT * FROM jobs WHERE id = ? OR (status = 'matched' AND ats = 'greenhouse' AND (title || ' ' || company_name) LIKE ?) ORDER BY score DESC LIMIT 1`)
+      .get(q, `%${q}%`) as any;
+    if (!job) throw new Error(`no matched Greenhouse job for "${q}"`);
+    const resume = args.includes("--resume") ? args[args.indexOf("--resume") + 1] : join(PROFILE_DIR, "Tanish_Resume.pdf");
+    const plan = await planApplication(db, job.id, resume);
+    if (plan.blockers.length) console.log(`⚠️  ${plan.blockers.length} question(s) still need you; they'll be left empty:\n   ${plan.blockers.join("\n   ")}`);
+    const outDir = join(DATA_DIR, "applications", "dry-runs");
+    mkdirSync(outDir, { recursive: true });
+    const shot = join(outDir, `${job.company_name.replace(/\W+/g, "_")}-${job.external_id}.png`);
+    const p = loadProfile();
+    const ctxB = await botBrowser();
+    const page = await ctxB.newPage();
+    const report = await fillGreenhouse(
+      page,
+      { boardToken: job.board_token, externalId: job.external_id },
+      plan,
+      { city: p.identity.city, country: p.identity.country, phone: p.identity.phone.replace(/[^\d+]/g, "") },
+      {
+        profile: p,
+        bank: (await import("./agents/jobs/apply/answers.js")).loadAnswerBank(),
+        job: { company: job.company_name, title: job.title, location: job.location ?? "" },
+        resumePdf: resume,
+      },
+      shot,
+    );
+    console.log(`\n${job.title} @ ${job.company_name}\n${report.url}`);
+    for (const f of report.filled) console.log(`  ✅ ${f.label} → ${f.value}`);
+    for (const f of report.failed) console.log(`  ❌ ${f.label}: ${f.error}`);
+    for (const f of report.skipped) console.log(`  ·  ${f.label} (${f.reason})`);
+    console.log(`captcha: ${report.captcha}\nscreenshot: ${report.screenshot}\nNOT SUBMITTED (dry run)`);
+    if (!args.includes("--keep-open")) await closeBotBrowser();
+    break;
+  }
+  case "pair": {
+    const tg = await import("./core/channels/telegram.js");
+    if (tg.ownerChatId()) {
+      console.log("Telegram already paired.");
+      break;
+    }
+    const code = tg.beginPairing();
+    console.log(`Send this to your bot on Telegram within 10 minutes:  /start ${code}`);
+    const ac = new AbortController();
+    const timer = setInterval(() => {
+      if (tg.ownerChatId()) {
+        console.log("PAIRED");
+        ac.abort();
+      }
+    }, 1000);
+    setTimeout(() => ac.abort(), 10 * 60_000);
+    await tg.pollTelegram({ commands: {}, signal: ac.signal });
+    clearInterval(timer);
+    if (!tg.ownerChatId()) console.log("pairing timed out");
+    break;
+  }
   case "rejections": {
     const rows = db
       .prepare(`SELECT json_extract(reasons, '$[0]') reason, COUNT(*) n FROM jobs WHERE status = 'rejected' GROUP BY 1 ORDER BY n DESC LIMIT 25`)
