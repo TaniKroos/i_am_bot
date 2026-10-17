@@ -76,24 +76,26 @@ switch (cmd) {
   }
   case "tailor": {
     // Trial run: build one tailored resume for a matched job (by id, or by text in title/company).
-    const q = args.join(" ");
+    const model = args.includes("--model") ? args[args.indexOf("--model") + 1] : undefined;
+    const q = args.filter((a, i) => a !== "--model" && args[i - 1] !== "--model").join(" ");
     const job = db
       .prepare(`SELECT id, title, company_name FROM jobs WHERE id = ? OR (status = 'matched' AND (title || ' ' || company_name) LIKE ?)
                 ORDER BY score DESC LIMIT 1`)
       .get(q, `%${q}%`) as { id: string; title: string; company_name: string } | undefined;
     if (!job) throw new Error(`no matched job for "${q}"`);
-    console.log(`Tailoring for ${job.title} @ ${job.company_name}\n`);
+    console.log(`Tailoring for ${job.title} @ ${job.company_name} (model: ${model ?? "default"})\n`);
     const { tailorResume } = await import("./agents/jobs/tailor.js");
-    const out = await tailorResume(db, job.id, (e) => {
+    const out = await tailorResume(db, job.id, { model, onEvent: (e) => {
       if (e.type !== "assistant") return;
       for (const c of (e as any).message?.content ?? []) {
         if (c.type === "tool_use") console.log(`  · ${c.name} ${String(c.input?.command ?? c.input?.file_path ?? "").slice(0, 100)}`);
         if (c.type === "text" && c.text.trim()) console.log(`  ${c.text.trim().slice(0, 200)}`);
       }
-    });
+    } });
     console.log(`\nresult: ${out.run.ok ? "ok" : "FAILED " + out.run.error} — ${out.run.result}`);
     console.log(`turns ${out.run.turns}, ${Math.round(out.run.durationMs / 1000)}s, API-equivalent $${out.run.costUsd?.toFixed(2) ?? "?"}`);
     console.log(`checks: pages=${out.checks.pages} overfull=${out.checks.overfull} underfull=${out.checks.underfull}`);
+    console.log(`truth check: ${JSON.stringify(out.truth)}\nverdict: ${out.verdict.toUpperCase()}`);
     console.log(`folder: ${out.dir}\npdf: ${out.pdf ?? "(none)"}`);
     break;
   }

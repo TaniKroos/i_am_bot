@@ -7,6 +7,7 @@ import { DATA_DIR, PROFILE_DIR, ROOT } from "../../core/config.js";
 import type { DB } from "../../core/db.js";
 import { runClaudeCode, type ClaudeCodeEvent, type ClaudeCodeResult } from "../../core/workers/claude-code.js";
 import { loadProfile } from "./profile.js";
+import { truthCheck, type TruthCheck } from "./truthcheck.js";
 
 const LATEX_BIN = join(ROOT, "tools", "latex", "bin");
 const BASE_TEX = join(PROFILE_DIR, "resume.tex");
@@ -75,8 +76,13 @@ You are running **headless inside grokBot**. Nobody can answer questions during 
 2. **The owner is Tanish Saini.** Ignore any other person, file name or project named in the skill
    (e.g. "Yash Gupta", "AI Interviewer", "Fluxpay", "Google referral").
    Write \`${fileStem}.tex\` and compile it to \`${fileStem}.pdf\`.
-3. **Truth source:** only base_resume.tex and facts.md. You may select, reorder, rephrase and re-bold.
+3. **Truth source:** only base_resume.tex and facts.md (including its \`verified_claims\`). You may select, reorder, rephrase and re-bold.
    Never add an employer, title, date, tool, project, certification or number that isn't there. Keep every metric exactly as given.
+   Respect \`do_not_claim\` and \`do_not_list_terms\` in facts.md absolutely.
+   - Keep each number with the system it belongs to (e.g. "800+ engineers" is the MCP skills platform, not the RAG pipeline).
+   - Keep each project's stack exactly as listed in base_resume.tex; don't swap technologies between projects.
+   - Don't add scope adjectives the sources don't support ("existing", "enterprise-wide", "large-scale", "ML").
+   - Keep the **section order of base_resume.tex** (Education stays near the top); reorder bullets, projects and skills freely.
 4. **Total experience is ${loadProfile().facts.total_experience_years} years.** Never claim more (no "2+ years", no "senior").
 5. **"Ask, don't presume" → write it down instead.** Put each question under "Questions for owner" in notes.md and keep the safe choice (leave it out) in the resume.
 6. **Tools:** \`pdflatex\`, \`pdfinfo\`, \`pdftoppm\` work here (they run in a sandbox; the first call may take a few seconds).
@@ -96,15 +102,22 @@ export interface TailorOutcome {
   pdf: string | null;
   run: ClaudeCodeResult;
   checks: { pages: number | null; overfull: number; underfull: number };
+  truth: TruthCheck | null;
+  /** ready = all checks pass; review = borrowed wording to approve; blocked = forbidden term, invented number or bad layout. */
+  verdict: "ready" | "review" | "blocked";
 }
 
-export async function tailorResume(db: DB, jobId: string, onEvent?: (e: ClaudeCodeEvent) => void): Promise<TailorOutcome> {
+export async function tailorResume(
+  db: DB,
+  jobId: string,
+  opts: { model?: string; onEvent?: (e: ClaudeCodeEvent) => void } = {},
+): Promise<TailorOutcome> {
   if (!existsSync(BASE_TEX)) throw new Error(`Base resume missing: put your LaTeX source at ${BASE_TEX}`);
   const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId) as any;
   if (!job) throw new Error(`No job ${jobId}`);
 
   const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-  const dir = join(DATA_DIR, "applications", `${date}-${slug(job.company_name)}-${slug(job.title)}`);
+  const dir = join(DATA_DIR, "applications", `${date}-${slug(job.company_name)}-${slug(job.title)}${opts.model ? `-${opts.model}` : ""}`);
   const fileStem = `Tanish_Saini_${slug(job.company_name)}_${slug(job.title).slice(0, 30)}_Resume`;
   mkdirSync(dir, { recursive: true });
 
@@ -124,7 +137,8 @@ export async function tailorResume(db: DB, jobId: string, onEvent?: (e: ClaudeCo
     extraPath: [LATEX_BIN],
     maxTurns: 80,
     timeoutMs: 30 * 60_000,
-    onEvent,
+    model: opts.model,
+    onEvent: opts.onEvent,
   });
 
   // Independent verification: don't take the session's word for it.
@@ -137,5 +151,21 @@ export async function tailorResume(db: DB, jobId: string, onEvent?: (e: ClaudeCo
     checks.overfull = (log.match(/Overfull/g) ?? []).length;
     checks.underfull = (log.match(/Underfull/g) ?? []).length;
   }
-  return { dir, pdf: existsSync(pdf) ? pdf : null, run, checks };
+  let truth: TruthCheck | null = null;
+  const tex = join(dir, `${fileStem}.tex`);
+  if (existsSync(tex)) {
+    const profile = loadProfile();
+    truth = truthCheck({
+      tailoredTex: readFileSync(tex, "utf8"),
+      baseTex: readFileSync(BASE_TEX, "utf8"),
+      factsText: `${factsMarkdown()}\n${(profile.facts.approved_terms ?? []).join(" ")}`,
+      jdText: readFileSync(join(dir, "jd.md"), "utf8"),
+      forbiddenTerms: profile.facts.do_not_list_terms ?? [],
+    });
+    writeFileSync(join(dir, "truthcheck.json"), JSON.stringify(truth, null, 2));
+  }
+  const layoutOk = checks.pages === 1 && checks.overfull === 0;
+  const verdict: TailorOutcome["verdict"] =
+    !run.ok || !layoutOk || !truth || truth.forbidden.length || truth.unknownNumbers.length ? "blocked" : truth.borrowedTerms.length ? "review" : "ready";
+  return { dir, pdf: existsSync(pdf) ? pdf : null, run, checks, truth, verdict };
 }
