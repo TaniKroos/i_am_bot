@@ -1,0 +1,4 @@
+#!/bin/sh
+set -e
+exec docker run --rm --network none --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges \
+  --memory 1g --cpus 2 -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/work -w /work grokbot-latex:1 "$(basename "$0")" "$@"

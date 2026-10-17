@@ -5,3 +5,4 @@ profile/
 .env
 *.db
 *.db-*
+.DS_Store
