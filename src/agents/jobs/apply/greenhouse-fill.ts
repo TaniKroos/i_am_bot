@@ -71,7 +71,17 @@ async function fillField(page: Page, p: PlannedField): Promise<string> {
       return label;
     }
     case "multiselect": {
-      const labels = (Array.isArray(value) ? value : [value]).map((v) => optionLabel(p, v));
+      const values = Array.isArray(value) ? value : [value];
+      // Short option lists ("I Agree", "I acknowledge") render as a fieldset of checkboxes with ids "<key>_<value>".
+      if (await el.locator("xpath=self::fieldset").count()) {
+        for (const v of values) {
+          const box = page.locator(esc(`${field.key}_${v}`));
+          await box.check();
+          if (!(await box.isChecked())) throw new Error(`checkbox "${optionLabel(p, v)}" did not stay checked`);
+        }
+        return values.map((v) => optionLabel(p, v)).join(", ");
+      }
+      const labels = values.map((v) => optionLabel(p, v));
       for (const l of labels) await pickOption(page, field.key, l);
       return labels.join(", ");
     }
@@ -111,6 +121,12 @@ export async function fillGreenhouse(
       report.skipped.push({ label, reason: "filled via the location box" });
       continue;
     }
+    if (p.field.key === "phone") continue; // filled below together with its country-code picker
+    // Optional and conditional fields (e.g. EEO "Race", shown only after certain answers) may not be on the page.
+    if (!p.field.required && (await page.locator(esc(p.field.key)).count()) === 0) {
+      report.skipped.push({ label, reason: "optional field not shown on the page" });
+      continue;
+    }
     try {
       report.filled.push({ label, value: await fillField(page, p) });
     } catch (e) {
@@ -119,24 +135,38 @@ export async function fillGreenhouse(
   }
 
   // Page-level widgets that aren't in the question list: phone country and the location autocomplete.
-  // Phone country code: typing the number with +91 sets it; only pick it by hand if the page didn't.
+  // Phone: with a separate country-code picker, pick the code there and type only the national number.
+  const digits = extras.phone.replace(/\D/g, "");
+  // Profile phone is written as "+<code>-<number>" (e.g. "+91-8447951790"); the separator marks where the code ends.
+  const dial = extras.phone.match(/^\+(\d{1,3})[\s-]/)?.[1] ?? "91";
+  const national = digits.startsWith(dial) && digits.length > 10 ? digits.slice(dial.length) : digits;
   const phone = page.locator(esc("phone"));
-  if (await phone.count()) await phone.fill(extras.phone);
-  if (await page.locator(esc("country")).count()) {
-    let shown = await selectedText(page, "country");
-    if (!shown.includes("+91")) {
-      try {
-        const input = page.locator(esc("country"));
-        await input.click();
-        await input.pressSequentially(extras.country, { delay: 15 });
-        await page.getByRole("option", { name: new RegExp(`^${extras.country}\\b`) }).first().click();
-        shown = await selectedText(page, "country");
-      } catch {
-        /* reported below */
+  const hasPicker = (await page.locator(esc("country")).count()) > 0;
+  if (await phone.count()) {
+    if (hasPicker) {
+      let shown = await selectedText(page, "country");
+      if (!shown.includes(`+${dial}`)) {
+        try {
+          const input = page.locator(esc("country"));
+          await input.click();
+          await input.pressSequentially(extras.country, { delay: 15 });
+          await page.getByRole("option", { name: new RegExp(`^${extras.country}\\b`) }).first().click();
+          shown = await selectedText(page, "country");
+        } catch {
+          /* reported below */
+        }
       }
+      if (shown.includes(`+${dial}`)) report.filled.push({ label: "Phone country code", value: shown });
+      else report.failed.push({ label: "Phone country code", error: `shows "${shown}", expected +${dial}` });
+      await phone.fill(national);
+    } else {
+      await phone.fill(`+${dial}${national}`);
     }
-    if (shown.includes("+91")) report.filled.push({ label: "Phone country code", value: shown });
-    else report.failed.push({ label: "Phone country code", error: `shows "${shown}", expected +91` });
+    // Read back: the box must hold exactly the national number when there's a picker (no code duplicated).
+    const typed = (await phone.inputValue()).replace(/\D/g, "");
+    const expected = hasPicker ? national : `${dial}${national}`;
+    if (typed === expected) report.filled.push({ label: "Phone", value: await phone.inputValue() });
+    else report.failed.push({ label: "Phone", error: `shows "${await phone.inputValue()}", expected ${hasPicker ? national : "+" + dial + national}` });
   }
   const loc = page.locator(esc("candidate-location"));
   if (await loc.count()) {
@@ -187,7 +217,11 @@ async function requiredEmpty(page: Page): Promise<{ id: string; label: string; t
       if (!el.id || el.type === "hidden" || el.closest('[aria-hidden="true"]')) continue;
       const labelEl = document.getElementById(el.id + "-label") || document.querySelector('label[for="' + el.id + '"]');
       const label = ((labelEl && labelEl.textContent) || el.getAttribute("aria-label") || el.id).replace(/\\*/g, "").trim();
-      if (el.getAttribute("role") === "combobox") {
+      if (el.tagName === "FIELDSET") {
+        // Checkbox group ("I Agree"): answered when any box inside is checked.
+        const legend = el.querySelector("legend");
+        if (!el.querySelector("input:checked")) out.push({ id: el.id, label: ((legend && legend.textContent) || el.id).replace(/\\*/g, "").trim(), type: "multiselect" });
+      } else if (el.getAttribute("role") === "combobox") {
         const control = el.closest(".select__control");
         const chosen = control && control.querySelector(".select__single-value, .select__multi-value");
         if (!chosen && el.id !== "candidate-location" && el.id !== "country") out.push({ id: el.id, label, type: "select" });

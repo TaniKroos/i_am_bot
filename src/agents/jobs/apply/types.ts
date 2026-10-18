@@ -17,7 +17,7 @@ export interface FormField {
   group?: string;
 }
 
-export type AnswerSource = "profile" | "answer_bank" | "rule" | "eeo_decline" | "resume" | "consent";
+export type AnswerSource = "profile" | "answer_bank" | "rule" | "eeo_decline" | "resume" | "consent" | "composed";
 
 export type Answer =
   | { kind: "value"; value: string | string[]; source: AnswerSource; note?: string }

@@ -1,5 +1,5 @@
 import { USER_AGENT } from "../../../core/config.js";
-import type { BoardFetcher, Posting } from "../types.js";
+import { TemporarilyUnavailable, type BoardFetcher, type Posting } from "../types.js";
 import { getJson, htmlToText, NotFound, throttle } from "./http.js";
 
 interface WorkableJob {
@@ -20,7 +20,7 @@ export const workable: BoardFetcher = {
     const results: WorkableJob[] = [];
     let nextPage: string | undefined;
     for (let page = 0, retries = 0; page < MAX_PAGES; page++) {
-      await throttle("workable", 1500);
+      await throttle("workable", 3000);
       const res = await fetch(`https://apply.workable.com/api/v3/accounts/${token}/jobs`, {
         method: "POST",
         headers: { "user-agent": USER_AGENT, accept: "application/json", "content-type": "application/json" },
@@ -33,6 +33,8 @@ export const workable: BoardFetcher = {
         page--;
         continue;
       }
+      // Still rate-limited after backing off: skip this cycle quietly instead of burning task retries.
+      if (res.status === 429) throw new TemporarilyUnavailable(`workable ${token} rate-limited`);
       if (!res.ok) throw new Error(`${res.status} for workable ${token}`);
       const data = (await res.json()) as { total: number; results: WorkableJob[]; nextPage?: string };
       results.push(...data.results);
@@ -63,7 +65,7 @@ export const workable: BoardFetcher = {
   },
   async fetchDetails(token, externalId) {
     try {
-      await throttle("workable", 1500);
+      await throttle("workable", 3000);
       const d = await getJson<{ description?: string; requirements?: string; benefits?: string }>(
         `https://apply.workable.com/api/v2/accounts/${token}/jobs/${externalId}`,
       );

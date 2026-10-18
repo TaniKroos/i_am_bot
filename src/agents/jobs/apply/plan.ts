@@ -6,6 +6,7 @@ import type { DB } from "../../../core/db.js";
 import { loadProfile } from "../profile.js";
 import { answerField, loadAnswerBank } from "./answers.js";
 import { greenhouseForm } from "./greenhouse.js";
+import { appliedAtCompany } from "../applied.js";
 import type { ApplicationPlan, FormField } from "./types.js";
 
 const PENDING = join(PROFILE_DIR, "questions-pending.yaml");
@@ -15,7 +16,8 @@ async function formFor(job: any): Promise<FormField[]> {
   throw new Error(`form reader for ${job.ats} not built yet`);
 }
 
-export async function planApplication(db: DB, jobId: string, resumePdf: string | null): Promise<ApplicationPlan> {
+/** `composed`: answers the composer wrote for questions the rules couldn't answer (field key → value). */
+export async function planApplication(db: DB, jobId: string, resumePdf: string | null, composed: Record<string, string | string[]> = {}): Promise<ApplicationPlan> {
   const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId) as any;
   const fields = await formFor(job);
   const ctx = {
@@ -23,8 +25,14 @@ export async function planApplication(db: DB, jobId: string, resumePdf: string |
     bank: loadAnswerBank(),
     job: { company: job.company_name, title: job.title, location: job.location ?? "" },
     resumePdf,
+    history: { companyApplications180d: appliedAtCompany(db, job.company_name, Date.now() - 180 * 86_400_000) },
   };
-  const planned = fields.map((field) => ({ field, answer: answerField(field, ctx) }));
+  const planned = fields.map((field) => {
+    const answer = answerField(field, ctx);
+    return answer.kind === "ask" && composed[field.key] !== undefined
+      ? { field, answer: { kind: "value" as const, value: composed[field.key], source: "composed" as const } }
+      : { field, answer };
+  });
   const blockers = planned.flatMap((p) => (p.answer.kind === "ask" ? [p.answer.question] : []));
   return { jobId, fields: planned, blockers };
 }

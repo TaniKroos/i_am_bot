@@ -3,7 +3,9 @@ import { loadProfile } from "./profile.js";
 import { resolveUrl } from "./resolve.js";
 import { isLocationPlaceholder, scorePosting, screenPosting } from "./scorer.js";
 import { fetchers } from "./sources/index.js";
-import { prepareApplication, submitApplication, SUBMITTABLE } from "./pipeline.js";
+import { prepareApplication, settings, submitApplication, SUBMITTABLE } from "./pipeline.js";
+import { sendDigest } from "./digest.js";
+import { recordApplied, syncAppliedFromGmail } from "./applied.js";
 import { TemporarilyUnavailable, type Ats, type Posting } from "./types.js";
 
 /** Poll intervals by tier: hot companies every few minutes so we can apply early. */
@@ -159,24 +161,89 @@ export const jobsAgent: Agent = {
         ALTER TABLE applications ADD COLUMN resume_gap REAL;
       `,
     },
+    {
+      id: "jobs:005",
+      sql: `
+        -- Everything the owner has applied to (bot submissions + Gmail confirmations). Never apply twice.
+        CREATE TABLE applied (
+          id INTEGER PRIMARY KEY,
+          job_id TEXT,
+          company TEXT NOT NULL,       -- normalised
+          title TEXT,
+          fingerprint TEXT,            -- company|normalised title (catches reposts under new job ids)
+          source TEXT NOT NULL,        -- bot | gmail
+          applied_at INTEGER NOT NULL,
+          ref TEXT NOT NULL UNIQUE     -- job id or gmail message id
+        );
+        CREATE INDEX applied_job ON applied(job_id);
+        CREATE INDEX applied_fp ON applied(fingerprint, applied_at);
+        CREATE INDEX applied_company ON applied(company, applied_at);
+      `,
+    },
+    {
+      id: "jobs:006",
+      sql: `
+        ALTER TABLE applied ADD COLUMN req TEXT;   -- requisition id from the confirmation (e.g. 26014930, R-579867)
+        ALTER TABLE applied ADD COLUMN raw TEXT;   -- "from | subject" kept for re-parsing without refetching
+        CREATE INDEX applied_req ON applied(company, req);
+      `,
+    },
+    {
+      id: "jobs:007",
+      sql: `ALTER TABLE applications ADD COLUMN composed TEXT;   -- free-text answers written from profile/experience.md`,
+    },
+    {
+      id: "jobs:008",
+      sql: `ALTER TABLE jobs ADD COLUMN digested_at INTEGER;   -- when this match went out in a daily digest`,
+    },
   ],
 
   automations: [
+    {
+      // Keep the applied ledger current: bot submissions (backfill) and confirmations found in Gmail.
+      id: "sync-applied",
+      everyMs: 6 * 3600_000,
+      async run(ctx) {
+        const submitted = ctx.db
+          .prepare(`SELECT a.job_id, a.submitted_at, j.company_name, j.title FROM applications a JOIN jobs j ON j.id = a.job_id WHERE a.status = 'submitted'`)
+          .all() as any[];
+        for (const s of submitted) recordApplied(ctx.db, { jobId: s.job_id, company: s.company_name, title: s.title, source: "bot", appliedAt: s.submitted_at ?? Date.now(), ref: s.job_id });
+        const n = await syncAppliedFromGmail(ctx.db).catch((e) => (ctx.log("gmail_sync_error", { error: String(e) }), 0));
+        if (n) ctx.log("applied_synced", { fromGmail: n });
+      },
+    },
     {
       // Matched jobs with no application yet (backlog, or a newly supported careers system) enter the pipeline.
       id: "feed-pipeline",
       everyMs: 5 * 60_000,
       run(ctx) {
+        if (settings(ctx).find_only) return;
         const rows = ctx.db
           .prepare(
             `SELECT j.id, j.ats FROM jobs j LEFT JOIN applications a ON a.job_id = j.id
-             WHERE j.status = 'matched' AND (a.job_id IS NULL OR a.status = 'waiting_adapter')
+             WHERE j.status = 'matched' AND (a.job_id IS NULL OR a.status IN ('waiting_adapter', 'dry_run'))
              ORDER BY COALESCE(j.posted_at, j.first_seen_at) DESC LIMIT 50`,
           )
           .all() as { id: string; ats: string }[];
         for (const r of rows.filter((r) => SUBMITTABLE.has(r.ats))) {
           ctx.enqueue("prepare_application", { jobId: r.id }, { priority: 15, dedupeKey: `prepare:${r.id}`, maxAttempts: 2 });
         }
+      },
+    },
+    {
+      // Find-only mode: once a day after digest_hour, send every new match to Telegram for the owner to apply by hand.
+      id: "daily-digest",
+      everyMs: 10 * 60_000,
+      async run(ctx) {
+        const s = settings(ctx);
+        if (!s.find_only || new Date().getHours() < s.digest_hour) return;
+        const today = new Date().toDateString();
+        const last = ctx.db.prepare("SELECT value FROM kv WHERE agent = 'jobs' AND key = 'digest:last_day'").pluck().get();
+        if (last === today) return;
+        await sendDigest(ctx);
+        ctx.db
+          .prepare("INSERT INTO kv (agent, key, value) VALUES ('jobs', 'digest:last_day', ?) ON CONFLICT(agent, key) DO UPDATE SET value = excluded.value")
+          .run(today);
       },
     },
     {
@@ -198,7 +265,7 @@ export const jobsAgent: Agent = {
   ],
 
   // One resume at a time (Claude Pro usage) and one browser submission at a time.
-  concurrency: { poll_board: 8, resolve_company: 6, resolve_url: 4, score_job: 6, prepare_application: 1, submit_application: 1 },
+  concurrency: { poll_board: 8, resolve_company: 6, resolve_url: 4, score_job: 6, prepare_application: 2, submit_application: 1 },
 
   handlers: {
     prepare_application: prepareApplication,
@@ -275,8 +342,16 @@ export const jobsAgent: Agent = {
       };
 
       // Big boards list without descriptions: screen on title/location first, fetch details only for survivors.
+      // A queued application for a job that no longer fits (rules got stricter) is cancelled, never submitted.
+      const cancelApplication = (why: string) =>
+        ctx.db
+          .prepare(`UPDATE applications SET status = 'skipped', error = ?, updated_at = ? WHERE job_id = ? AND status NOT IN ('submitted', 'submitting', 'skipped')`)
+          .run(`no longer fits: ${why}`, Date.now(), id);
       const screened = screenPosting(posting, profile);
-      if (screened) return save({ status: "rejected", score: 0, reasons: JSON.stringify([screened]) });
+      if (screened) {
+        cancelApplication(screened);
+        return save({ status: "rejected", score: 0, reasons: JSON.stringify([screened]) });
+      }
       const fetcher = fetchers[posting.ats];
       if ((!posting.description || isLocationPlaceholder(posting.location)) && fetcher.fetchDetails) {
         const details = await fetcher.fetchDetails(posting.boardToken, posting.externalId);
@@ -288,9 +363,10 @@ export const jobsAgent: Agent = {
       const matched = !s.rejected && s.score >= MATCH_THRESHOLD;
       const reasons = s.rejected ? [s.rejected] : matched ? s.reasons : [...s.reasons, `score ${s.score} < ${MATCH_THRESHOLD}`];
       save({ score: s.score, min_years: s.minYears, reasons: JSON.stringify(reasons), status: matched ? "matched" : "rejected" });
+      if (!matched) cancelApplication(reasons.at(-1) ?? "rejected");
       if (matched) {
         ctx.notify(`New match (${s.score}): ${row.title} @ ${row.company_name} — ${posting.location}`, { id, url: row.url });
-        ctx.enqueue("prepare_application", { jobId: id }, { priority: 15, dedupeKey: `prepare:${id}`, maxAttempts: 2 });
+        if (!settings(ctx).find_only) ctx.enqueue("prepare_application", { jobId: id }, { priority: 15, dedupeKey: `prepare:${id}`, maxAttempts: 2 });
       }
     },
   },

@@ -55,10 +55,15 @@ export const isLocationPlaceholder = (loc: string) => /^\d+\s+locations?$/i.test
 /** Cheap title + location check that needs no description. Returns the rejection reason, or null to continue. */
 export function screenPosting(p: Posting, profile: Profile): string | null {
   const t = profile.targeting;
-  const title = p.title.toLowerCase();
+  const title = p.title.toLowerCase().replace(/_/g, " ");
   const excluded = t.titles_exclude.find((x) => wordMatch(title, x)) ?? (/\blead\b/.test(title) ? "lead" : undefined);
   if (excluded) return `title excludes "${excluded}"`;
   if (!t.titles_include.some((x) => wordMatch(title, x)) && !/\bengineer\b|\bdeveloper\b/.test(title)) return "title not a target role";
+  // A title built around a stack the owner doesn't use ("Java Developer", "SDE - Golang") isn't a fit.
+  const stack = title.match(/(?<![\w+#.])(java|golang|ruby|rails|php|laravel|scala|kotlin|c\+\+|rust|swift|flutter|salesforce|sap|abap|servicenow|mainframe|cobol|perl|elixir|unity|unreal|spring)(?![\w+#])/)?.[1] ??
+    (/\(go\)|\bgo\s+(developer|engineer|backend)|[-–,]\s*go\s*$/.test(title) ? "go" : undefined);
+  const known = [...t.skills.strong, ...t.skills.familiar].map((x) => x.toLowerCase());
+  if (stack && !known.includes(stack)) return `title asks for ${stack}, which isn't in your skills`;
   // Workday lists multi-city jobs as "3 Locations": decide after the details fetch fills in the real ones.
   if (isLocationPlaceholder(p.location)) return null;
   if (locationFit(p) === "no") return `location "${p.location || "unknown"}" not India/remote-India`;
@@ -67,7 +72,7 @@ export function screenPosting(p: Posting, profile: Profile): string | null {
 
 export function scorePosting(p: Posting, profile: Profile): Score {
   const t = profile.targeting;
-  const title = p.title.toLowerCase();
+  const title = p.title.toLowerCase().replace(/_/g, " ");
   const reasons: string[] = [];
   const result = (rejected: string | null, score = 0, minYears: number | null = null, loc: Score["locationFit"] = "no"): Score => ({
     score,
@@ -85,9 +90,9 @@ export function scorePosting(p: Posting, profile: Profile): Score {
   const minYears = minYearsRequired(p.description);
   if (minYears !== null && minYears > t.max_min_years_required) return result(`needs ${minYears}+ years`, 0, minYears, loc);
 
-  // With <2 years of experience, senior/level-3 roles only make sense when the JD itself asks for ≤2 years.
-  const senior = /\b(senior|sr|sde\s*(iii|3)|(engineer|developer)\s*(iii|3)|level\s*3|l3)\b/i.test(title);
-  if (senior && (minYears === null || minYears > 2)) return result("senior title without a ≤2y requirement", 0, minYears, loc);
+  // Owner rule: only roles that suit their level. Senior/level-3+ titles are out regardless of the JD's years.
+  const senior = /\b(senior|sr|sde[\s\-–]*(iii|3|iv|4)|(engineer|developer)[\s\-–,]*(iii|3|iv|4)|level\s*[3-9]|l[3-9])\b/i.test(title);
+  if (senior) return result("senior / level-3+ title (above owner's level)", 0, minYears, loc);
 
   let score = included ? 45 : 35;
   reasons.push(included ? `title: ${included}` : "title: generic engineer");
@@ -108,7 +113,6 @@ export function scorePosting(p: Posting, profile: Profile): Score {
   score += skillPoints;
   if (strong.length) reasons.push(`skills: ${strong.slice(0, 6).join(", ")}`);
 
-  if (senior) (score -= 10), reasons.push("senior title");
   if (/\b(junior|associate|sde\s*(i|1)|engineer\s*i\b|new grad|graduate)\b/i.test(title)) (score += 5), reasons.push("junior-friendly title");
 
   return result(null, Math.max(0, Math.min(100, score)), minYears, loc);

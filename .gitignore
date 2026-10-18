@@ -7,3 +7,4 @@ profile/
 *.db-*
 .DS_Store
 later.md
+.claude

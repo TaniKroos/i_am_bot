@@ -23,10 +23,13 @@ export interface AnswerContext {
   job: { company: string; title: string; location: string };
   /** Path of the tailored resume PDF to upload. */
   resumePdf: string | null;
+  /** Applications at this company in the last 180 days (applied ledger: bot + Gmail). Unknown → history questions are asked. */
+  history?: { companyApplications180d: number };
 }
 
 const OTHER_COUNTRIES =
   /\b(united states|u\.s\.|usa|us\b|america|canada|united kingdom|uk\b|britain|europe|eu\b|germany|ireland|netherlands|france|spain|poland|australia|singapore|japan|israel|brazil|mexico)/i;
+const ACK = /^(yes|i (agree|acknowledge|accept|consent|confirm|understand|certify|have read)|agree|accept|acknowledged?|confirm(ed)?|understood)\b/i;
 const DECLINE = /(don.?t wish|do not wish|decline|prefer not|not to (answer|disclose|say)|choose not)/i;
 
 /** Pick the option that best matches a desired answer (exact → starts with → contains). */
@@ -84,16 +87,25 @@ export function answerField(field: FormField, ctx: AnswerContext): Answer {
   for (const e of ctx.bank) {
     if (new RegExp(e.match, "i").test(label)) {
       const ans = value(field, fill(e.answer), "answer_bank");
-      if (ans.kind !== "value" && e.fallback_options) return value(field, fill(e.fallback_options), "answer_bank");
+      if (!e.fallback_options) return ans;
+      // Options unknown until the page is searched (Workday prompts): hand over the whole preference list.
+      if ((field.type === "select" || field.type === "multiselect") && !field.options?.length)
+        return { kind: "value", value: [fill(e.answer), fill(e.fallback_options)].flat(), source: "answer_bank" };
+      if (ans.kind === "value") return ans;
+      // Fallbacks in the owner's order: the first one that matches an option wins.
+      for (const fb of fill(e.fallback_options) as string[]) {
+        const a = value(field, fb, "answer_bank");
+        if (a.kind === "value") return a;
+      }
       return ans;
     }
   }
 
   // 2) Voluntary demographic questions: always decline.
-  if (field.group === "eeoc" || /\b(gender|race|ethnic|hispanic|latino|veteran|disability|sexual orientation|pronoun|transgender)\b/i.test(L)) {
+  if (field.group === "eeoc" || /\b(gender|sex|race|ethnic|hispanic|latino|veteran|disability|sexual orientation|pronoun|transgender)\b/i.test(L)) {
     const decline = field.options?.find((o) => DECLINE.test(o.label));
     if (decline && !field.required) return { kind: "value", value: decline.value, source: "eeo_decline", note: decline.label };
-    if (/\bgender\b/.test(L) && f.gender) return value(field, f.gender, "profile", "owner answers when required");
+    if (/\b(gender|sex)\b/.test(L) && f.gender) return value(field, f.gender, "profile", "owner answers when required");
     if (decline) return { kind: "value", value: decline.value, source: "eeo_decline", note: decline.label };
     return field.required ? { kind: "ask", question: label } : { kind: "skip", reason: "voluntary demographic question" };
   }
@@ -110,9 +122,13 @@ export function answerField(field: FormField, ctx: AnswerContext): Answer {
   if (/^first name|given name/.test(L)) return value(field, id.first_name, "profile");
   if (/^last name|surname|family name/.test(L)) return value(field, id.last_name, "profile");
   if (/^(full |legal )?name$/.test(L)) return value(field, id.full_name, "profile");
+  if (/i have a preferred name/.test(L)) return { kind: "skip", reason: "no preferred name" };
   if (/preferred last name/.test(L)) return value(field, id.last_name, "profile");
   if (/preferred (first )?name|name you.?d prefer/.test(L)) return value(field, id.first_name, "profile");
+  if (/phone device type|phone type/.test(L)) return value(field, ["Mobile", "Cell", "Mobile Phone", "Personal Mobile"], "profile");
+  if (/country phone code|phone country code|country code/.test(L)) return value(field, [`${id.country} (+${String(id.phone).match(/^\+(\d{1,3})/)?.[1] ?? "91"})`, id.country], "profile");
   if (/e-?mail/.test(L) && !/confirm/.test(L) && field.type !== "checkbox" && field.type !== "select") return value(field, id.email, "profile");
+  if (/extension/.test(L) && /phone/.test(L)) return { kind: "skip", reason: "no phone extension" };
   if (/phone|mobile/.test(L) && field.type !== "select") return value(field, id.phone, "profile");
   if (/linkedin/.test(L)) return id.links?.linkedin ? value(field, id.links.linkedin, "profile") : { kind: "skip", reason: "no LinkedIn" };
   if (/github/.test(L) && !/username/.test(L)) return id.links?.github ? value(field, id.links.github, "profile") : { kind: "skip", reason: "no GitHub" };
@@ -121,24 +137,42 @@ export function answerField(field: FormField, ctx: AnswerContext): Answer {
 
   // 5) Work authorisation first (its wording mentions "country"/"location"), then location.
   if (/employment agreement|non-?compete|post-employment|restrictive covenant/.test(L)) return field.required ? { kind: "ask", question: label } : { kind: "skip", reason: "owner-specific" };
+  // Free-text questions that ask for details deserve a sentence, not "Yes"/"No".
+  const freeText = field.type === "text" || field.type === "textarea";
+  if (freeText && /work authori[sz]ation|right to work|visa status/.test(L) && /(detail|describe|outline|explain|provide)/.test(L))
+    return jobInIndia ? value(field, "Indian citizen, authorised to work in India. No sponsorship required for roles in India.", "profile") : { kind: "ask", question: label };
+  if (freeText && /notice period/.test(L) && /(compensation|ctc|salary|package)/.test(L))
+    return value(field, `${f.notice_period_days}-day notice period. Current CTC: ${f.current_ctc_lpa} LPA; expected: ${f.expected_ctc_answer ?? `${f.expected_ctc_lpa} LPA`}.`, "profile");
+  // "List the countries where you need sponsorship" (free text, country names only as examples).
+  if (/sponsor/.test(L) && /(indicate|list|separate each|which (countries|locations))/.test(L) && (field.type === "text" || field.type === "textarea"))
+    return jobInIndia ? value(field, "Not applicable (N/A)", "profile", "seeking roles in India only") : { kind: "ask", question: label };
   if (/sponsor|visa/.test(L)) {
     const abroad = OTHER_COUNTRIES.test(L) || (!jobInIndia && !/india/.test(L));
     if (abroad) return f.work_authorization?.needs_sponsorship_outside_india ? value(field, "Yes", "profile", "needs sponsorship outside India") : { kind: "ask", question: label };
     return value(field, "No", "profile", "no sponsorship needed in India");
   }
-  if (/(authori[sz]ed|eligible|legally|right) to work/.test(L)) {
+  if (/citizen of the country (you are|you're) applying|citizen of (the )?country of (the )?(role|position|job)/.test(L)) return jobInIndia ? value(field, "Yes", "profile", "Indian citizen, India role") : { kind: "ask", question: label };
+  if (/(authori[sz]ed|eligible|legally|right) to work|valid (work|residency|residence) permit/.test(L)) {
     if (OTHER_COUNTRIES.test(L)) return value(field, "No", "profile", "not authorised outside India");
     if (/india/.test(L) || jobInIndia) return value(field, "Yes", "profile", "authorised in India");
     return { kind: "ask", question: label };
   }
   if (/^country( of residence)?$|country of residence|current country|which country do you (live|reside)|country (you|in which you) (live|reside|are based)|country in which you will be located/.test(L))
     return value(field, id.country, "profile");
+  // Split address forms (Workday): only from identity.address, so every part comes from the same address.
+  const addr = id.address as { line1?: string; line2?: string; city?: string; state?: string; postal_code?: string } | undefined;
+  if (/^address line 1$|^street( address)?$/.test(L)) return addr?.line1 ? value(field, addr.line1, "profile") : field.required ? { kind: "ask", question: label } : { kind: "skip", reason: "no address in profile" };
+  if (/^address line 2$/.test(L)) return addr?.line2 ? value(field, addr.line2, "profile") : { kind: "skip", reason: "no second address line" };
+  if (/^(postal|zip|pin) ?code$|^postcode$|^pin$/.test(L)) return addr?.postal_code ? value(field, addr.postal_code, "profile") : field.required ? { kind: "ask", question: label } : { kind: "skip", reason: "no address in profile" };
+  if (/^(current )?city$/.test(L) && field.type === "text") return value(field, addr?.city ?? id.city, "profile");
+  if (/^(state|region|province|state ?\/ ?province)$/.test(L)) return value(field, field.type === "select" ? [addr?.state ?? id.state, `${addr?.state ?? id.state} (IN)`] : (addr?.state ?? id.state), "profile");
   if (/^(current )?(city|location)$|current (city|location)|where are you (currently )?(located|based)|city and state.*(residence|live)|primary residence/.test(L) && field.type !== "checkbox")
     return value(field, field.type === "select" ? [id.city, id.state, id.country] : `${id.city}, ${id.state}, ${id.country}`, "profile");
   if (/^location\b/.test(L) && field.group === "location") return value(field, `${id.city}, ${id.state}, ${id.country}`, "profile");
   if (/preferred (work )?location/.test(L) && field.type !== "select") return value(field, "Open to any location in India", "profile");
   if (/relocat/.test(L)) return jobInIndia ? value(field, "Yes", "profile", "open anywhere in India") : { kind: "ask", question: label };
-  if (/office|on-?site|hybrid|in-person|\bwfo\b/.test(L) && /willing|able|comfortable|open|ok|okay|commit|ready/.test(L))
+  if (/alternat(iv)?e (contact )?(phone |mobile )?(number|phone)|other contact number/.test(L) && field.type !== "select") return value(field, id.phone, "profile", "only number on file");
+  if (/\b(office|on-?site|hybrid|in-person|wfo)\b/.test(L.replace(/office hours/g, "")) && /\b(willing|able|comfortable|open|ok|okay|commit|ready)\b/.test(L))
     return jobInIndia ? value(field, "Yes", "profile") : { kind: "ask", question: label };
 
   // 6) Experience, notice, compensation.
@@ -148,13 +182,13 @@ export function answerField(field: FormField, ctx: AnswerContext): Answer {
     const yes = lessMore[1] === "more" ? f.total_experience_years > n : f.total_experience_years < n;
     return value(field, yes ? "Yes" : "No", "profile", `${f.total_experience_years} years`);
   }
-  if (/years? of (professional |relevant |total |work )?experience|how many years/.test(L)) {
+  if (/years? of (professional |relevant |total |work )?experience|(relevant|total|overall) years of experience|how many years/.test(L)) {
     if (field.type === "select" && field.options) {
       const o = matchYearsOption(field.options, f.total_experience_years);
       return o ? { kind: "value", value: o.value, source: "profile", note: o.label } : { kind: "ask", question: label };
     }
     // Skill-specific years ("years of Java") aren't in the profile.
-    if (/years? of (professional |relevant |total |work )?experience\s*$|total|overall|how many years of (professional |work )?experience/.test(L)) return value(field, String(f.total_experience_years), "profile");
+    if (/years? of (professional |relevant |total |work )?experience[\s.?]*$|total|overall|relevant years|how many years of (professional |work )?experience/.test(L)) return value(field, String(f.total_experience_years), "profile");
     return field.required ? { kind: "ask", question: label } : { kind: "skip", reason: "skill-specific years not in profile" };
   }
   if (/notice period/.test(L)) return value(field, field.type === "select" ? ["30 days", "1 month", "30"] : "30 days", "profile");
@@ -169,20 +203,37 @@ export function answerField(field: FormField, ctx: AnswerContext): Answer {
   }
 
   // 7) Education.
-  if (/(university|college|school|institution)/.test(L) && !/high school/.test(L)) return value(field, f.university, "profile");
+  // Searchable school lists may hold the college, its short name, or only the affiliating university (GGSIPU).
+  if (/(university|college|school|institution)/.test(L) && !/high school/.test(L))
+    return value(field, field.type === "select" && !field.options?.length ? [f.university, ...(f.university_search ?? [])] : f.university, "profile");
   if (/degree|qualification/.test(L)) return value(field, field.type === "select" ? ["Bachelor", "B.Tech", "B.E", "Bachelor's"] : f.degree, "profile");
   if (/graduat(ion|ed).*(year|date)|year of (graduation|passing)/.test(L)) return value(field, String(f.graduation_year), "profile");
   if (/\b(gpa|cgpa|grade)\b/.test(L)) return value(field, String(f.cgpa), "profile");
 
-  // 8) History with this company.
-  if (/(previously|ever|before|currently).*(work|employ|consult|intern|appl)|(worked|employed) (at|by|for)/.test(L) && L.includes(job.company.toLowerCase().split(/\s/)[0]))
+  // 8) History with this company: from the applied ledger, never guessed.
+  const co = job.company.toLowerCase().split(/\s/)[0];
+  const aboutUs = L.includes(co) || /this (company|organi[sz]ation)|\bwith us\b/.test(L);
+  if (aboutUs && /(active|current|pending|open|in-progress) application/.test(L)) {
+    if (!ctx.history) return { kind: "ask", question: label };
+    return value(field, ctx.history.companyApplications180d > 0 ? "Yes" : "No", "profile", `${ctx.history.companyApplications180d} application(s) at ${job.company} in 180 days`);
+  }
+  if (aboutUs && /(declined|rejected|unsuccessful|not (been )?selected|turned down)/.test(L)) {
+    if (ctx.history?.companyApplications180d === 0) return value(field, "No", "profile", `no applications at ${job.company} in 180 days`);
+    return { kind: "ask", question: label };
+  }
+  if (/(previously|ever|before|currently).*(work|employ|consult|intern|appl)|(worked|employed) (at|by|for)/.test(L) && (L.includes(job.company.toLowerCase().split(/\s/)[0]) || /this (company|organi[sz]ation)|\bus\b|previous worker|former (employee|worker)/.test(L)))
     return value(field, "No", "profile", `never employed by ${job.company}`);
   if (/^(current|present)( or last)? (employer|company|firm)( name)?\??$|name of (your )?(current|present) (employer|company|firm)|current or last (payroll )?company name|current firm/.test(L))
     return value(field, f.current_employer, "profile");
   if (/current (job )?title|current (role|position|designation)/.test(L)) return value(field, f.current_title, "profile");
 
-  // 9) Required consents to submit the application itself.
-  if (field.required && /(privacy|consent|acknowledge|agree|terms|certify|accurate)/.test(L)) {
+  // 9) Consents. A required question whose only option is "I agree" / "I acknowledge" is a condition of applying.
+  const ack = field.options?.length === 1 ? field.options.find((o) => ACK.test(o.label.trim())) : undefined;
+  if (ack && (field.required || /(evaluat|consider).*(candidacy|application|roles|opportunit)/.test(L)) && (field.type === "select" || field.type === "multiselect"))
+    return { kind: "value", value: field.type === "multiselect" ? [ack.value] : ack.value, source: "consent", note: ack.label };
+  // Real consents only: "terms" also appears in questions like "as such terms are defined…".
+  const question = /^(have|has|are|is|do|does|did|were|was|in the (last|past)|within|how|what|which|when|why|please (advise|indicate|confirm whether))\b/.test(L);
+  if (field.required && !question && /(privacy (policy|notice|statement)|\bconsent\b|\backnowledge|\bi (agree|accept|certify|confirm|have read)|terms (and|&) conditions|terms of (use|service)|certify that|accurate and complete)/.test(L)) {
     if (field.type === "checkbox") return { kind: "value", value: "true", source: "consent", note: "required to submit" };
     const yes = field.options?.find((o) => /^(yes|i (agree|acknowledge|consent|confirm))/i.test(o.label));
     if (yes && (field.type === "select" || field.type === "multiselect"))

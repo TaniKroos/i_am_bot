@@ -58,7 +58,7 @@ export function techTokens(text: string): Set<string> {
   return out;
 }
 
-function numbers(text: string): Set<string> {
+export function numbers(text: string): Set<string> {
   return new Set([...text.matchAll(/\d[\d,.]*\s*(?:%|\+|K\+?|×|x\b|ms)?/g)].map((m) => m[0].replace(/\s+/g, "").replace(/,/g, "").replace(/\.$/, "")));
 }
 
