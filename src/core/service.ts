@@ -19,15 +19,16 @@ const target = () => `gui/${userInfo().uid}`;
 
 const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-function plist(): string {
+/** Label, `bot <command>` and environment shared by both launchd jobs. */
+function plistHead(label: string, command: string): string {
   const node = process.execPath; // the Node that runs this command (Node 24 via nvm)
   const path = [dirname(node), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":");
-  const args = [node, join(ROOT, "node_modules", "tsx", "dist", "cli.mjs"), join(ROOT, "src", "cli.ts"), "run"];
+  const args = [node, join(ROOT, "node_modules", "tsx", "dist", "cli.mjs"), join(ROOT, "src", "cli.ts"), command];
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>${LABEL}</string>
+  <key>Label</key><string>${label}</string>
   <key>ProgramArguments</key>
   <array>
 ${args.map((a) => `    <string>${xml(a)}</string>`).join("\n")}
@@ -37,7 +38,11 @@ ${args.map((a) => `    <string>${xml(a)}</string>`).join("\n")}
   <dict>
     <key>PATH</key><string>${xml(path)}</string>
     <key>HOME</key><string>${xml(homedir())}</string>
-  </dict>
+  </dict>`;
+}
+
+function plist(): string {
+  return `${plistHead(LABEL, "run")}
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>LimitLoadToSessionType</key><string>Aqua</string>
@@ -89,4 +94,47 @@ export function serviceStatus(): string {
   const pid = info.match(/\bpid = (\d+)/)?.[1];
   const tail = existsSync(LOG) ? readFileSync(LOG, "utf8").trim().split("\n").slice(-5).join("\n") : "";
   return `Service: ${state}${pid ? ` (pid ${pid})` : ""}\nLog tail:\n${tail}`;
+}
+
+/**
+ * Scheduled `bot sweep` at fixed hours (default 9:00 and 18:00). Unlike the service this one is installed in
+ * ~/Library/LaunchAgents so it survives a restart, but it only ever runs at those hours (no RunAtLoad).
+ * If the Mac is asleep at that hour, launchd runs the missed sweep once on wake.
+ */
+const SWEEP_LABEL = "com.grokbot.sweep";
+const SWEEP_PLIST = join(homedir(), "Library", "LaunchAgents", `${SWEEP_LABEL}.plist`);
+const SWEEP_LOG = join(DATA_DIR, "logs", "sweep.log");
+
+export function scheduleSweep(hours: number[]): string {
+  mkdirSync(dirname(SWEEP_LOG), { recursive: true });
+  mkdirSync(dirname(SWEEP_PLIST), { recursive: true });
+  launchctl("bootout", `${target()}/${SWEEP_LABEL}`);
+  writeFileSync(
+    SWEEP_PLIST,
+    `${plistHead(SWEEP_LABEL, "sweep")}
+  <key>StartCalendarInterval</key>
+  <array>
+${hours.map((h) => `    <dict><key>Hour</key><integer>${h}</integer><key>Minute</key><integer>0</integer></dict>`).join("\n")}
+  </array>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>${xml(SWEEP_LOG)}</string>
+  <key>StandardErrorPath</key><string>${xml(SWEEP_LOG)}</string>
+</dict>
+</plist>
+`,
+  );
+  const err = launchctl("bootstrap", target(), SWEEP_PLIST);
+  return `${err.trim() ? `launchctl: ${err.trim()}\n` : ""}Sweep scheduled daily at ${hours.map((h) => `${h}:00`).join(" and ")}. Logs: ${SWEEP_LOG}\nRemove with: npm run bot -- unschedule`;
+}
+
+export function unscheduleSweep(): string {
+  launchctl("bootout", `${target()}/${SWEEP_LABEL}`);
+  rmSync(SWEEP_PLIST, { force: true });
+  return "Sweep schedule removed.";
+}
+
+export function sweepSchedule(): string | null {
+  if (!existsSync(SWEEP_PLIST)) return null;
+  const hours = [...readFileSync(SWEEP_PLIST, "utf8").matchAll(/<key>Hour<\/key><integer>(\d+)/g)].map((m) => `${m[1]}:00`);
+  return hours.join(" and ");
 }

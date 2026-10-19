@@ -89,12 +89,14 @@ export async function pollTelegram(opts: {
   commands: Record<string, CommandHandler>;
   onCallback?: CallbackHandler;
   signal?: AbortSignal;
+  /** Handle whatever arrived while no bot was running, then return (used by `sweep`). */
+  once?: boolean;
 }): Promise<void> {
   let offset = Number(kv.get("offset") ?? 0);
-  while (!opts.signal?.aborted) {
+  for (let first = true; !opts.signal?.aborted && (first || !opts.once); first = false) {
     let updates: any[] = [];
     try {
-      updates = await call<any[]>("getUpdates", { offset, timeout: 50, allowed_updates: ["message", "callback_query"] });
+      updates = await call<any[]>("getUpdates", { offset, timeout: opts.once ? 0 : 50, allowed_updates: ["message", "callback_query"] });
     } catch (e) {
       console.error(String(e));
       await new Promise((r) => setTimeout(r, 5000));
@@ -129,14 +131,15 @@ export async function pollTelegram(opts: {
         });
       };
       if (u.callback_query) {
-        await call("answerCallbackQuery", { callback_query_id: u.callback_query.id });
+        // Taps older than a few minutes (handled by a later sweep) can no longer be answered; that's fine.
+        await call("answerCallbackQuery", { callback_query_id: u.callback_query.id }).catch(() => undefined);
         await opts.onCallback?.(u.callback_query.data, reply);
         continue;
       }
       const m = text.match(/^\/(\w+)(?:@\w+)?\s*([\s\S]*)$/);
       const handler = m ? opts.commands[m[1]] : undefined;
       if (handler) await handler(m![2].trim(), reply);
-      else await reply(`Commands: ${Object.keys(opts.commands).map((c) => `/${c}`).join(" ")}`);
+      else if (!opts.once) await reply(`Commands: ${Object.keys(opts.commands).map((c) => `/${c}`).join(" ")}`);
     }
   }
 }

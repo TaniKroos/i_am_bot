@@ -36,7 +36,7 @@ export function fingerprint(company: string, title: string): string {
 
 export function recordApplied(
   db: DB,
-  a: { jobId?: string; company: string; title?: string; req?: string; raw?: string; source: "bot" | "gmail" | "workday"; appliedAt: number; ref: string },
+  a: { jobId?: string; company: string; title?: string; req?: string; raw?: string; source: "bot" | "gmail" | "workday" | "manual"; appliedAt: number; ref: string },
 ): void {
   db.prepare(
     `INSERT INTO applied (job_id, company, title, fingerprint, source, applied_at, ref, req, raw)

@@ -6,6 +6,7 @@ import { fetchers } from "./sources/index.js";
 import { prepareApplication, settings, submitApplication, SUBMITTABLE } from "./pipeline.js";
 import { sendDigest } from "./digest.js";
 import { recordApplied, syncAppliedFromGmail } from "./applied.js";
+import { referralMigrations } from "./referrals.js";
 import { TemporarilyUnavailable, type Ats, type Posting } from "./types.js";
 
 /** Poll intervals by tier: hot companies every few minutes so we can apply early. */
@@ -70,6 +71,13 @@ function rowToPosting(row: any): Posting {
     postedAt: row.posted_at,
     description: row.description ?? "",
   };
+}
+
+/** Queue one poll of every active board, whatever its tier or last poll (`sweep`, `poll --all`). Returns how many. */
+export function enqueueAllPolls(ctx: AgentContext): number {
+  const boards = ctx.db.prepare("SELECT ats, token, tier FROM companies WHERE active = 1").all() as { ats: Ats; token: string; tier: number }[];
+  for (const c of boards) ctx.enqueue("poll_board", { ats: c.ats, token: c.token }, { dedupeKey: `poll:${c.ats}:${c.token}`, priority: c.tier === 1 ? 5 : 0, maxAttempts: 1 });
+  return boards.length;
 }
 
 export const jobsAgent: Agent = {
@@ -196,6 +204,7 @@ export const jobsAgent: Agent = {
       id: "jobs:008",
       sql: `ALTER TABLE jobs ADD COLUMN digested_at INTEGER;   -- when this match went out in a daily digest`,
     },
+    ...referralMigrations,
   ],
 
   automations: [

@@ -1,6 +1,6 @@
 import { getDb } from "./core/db.js";
 import { Runtime } from "./core/runtime.js";
-import { jobsAgent } from "./agents/jobs/index.js";
+import { enqueueAllPolls, jobsAgent } from "./agents/jobs/index.js";
 import { SEED_TIER1, SEED_TIER2, SEED_URLS } from "./agents/jobs/seed.js";
 
 const runtime = new Runtime();
@@ -47,10 +47,65 @@ switch (cmd) {
     break;
   }
   case "poll": {
-    // One pass over every due board, then score.
-    await jobsAgent.automations![0].run(ctx);
+    // One pass over every board, then score (no digest, no applications).
+    runtime.restrict(["poll_board", "score_job"]);
+    enqueueAllPolls(ctx);
     await runtime.drain();
     console.log(db.prepare("SELECT status, COUNT(*) n FROM jobs GROUP BY status").all());
+    break;
+  }
+  case "sweep": {
+    // Twice-daily find-only run: poll every board once, score, send the digest with referral leads, exit.
+    // Only polling and scoring run here: queued applications from apply mode are left alone.
+    const { existsSync, readFileSync } = await import("node:fs");
+    const { DATA_DIR } = await import("./core/config.js");
+    const pidFile = `${DATA_DIR}/bot.pid`;
+    const other = existsSync(pidFile) ? Number(readFileSync(pidFile, "utf8")) : 0;
+    try {
+      if (other > 0 && process.kill(other, 0)) {
+        console.log(`grokBot is running continuously (pid ${other}); it polls and sends the digest itself. Skipping the sweep.`);
+        break;
+      }
+    } catch {}
+    const started = Date.now();
+    console.log(`\n=== sweep ${new Date().toLocaleString("en-IN")} ===`);
+    const { setSetting, settings } = await import("./agents/jobs/pipeline.js");
+    if (!settings(ctx).find_only) (setSetting(ctx, "find_only", 1), console.log("switched to find-only mode"));
+    const tg = await import("./core/channels/telegram.js");
+    const { onReferralCallback } = await import("./agents/jobs/referrals.js");
+    // "Sent" / "Followed up" taps made since the last sweep.
+    await tg.pollTelegram({ commands: {}, once: true, onCallback: (data, reply) => onReferralCallback(ctx, data, reply).then(() => undefined) }).catch((e) => console.error(String(e)));
+
+    runtime.restrict(["poll_board", "score_job"]);
+    db.prepare("UPDATE tasks SET status = 'queued' WHERE status = 'running' AND kind IN ('poll_board', 'score_job')").run();
+    const boards = enqueueAllPolls(ctx);
+    const matchedBefore = db.prepare("SELECT COUNT(*) FROM jobs WHERE status = 'matched'").pluck().get() as number;
+    // A stuck board must not hold the digest back: send what we have after 45 minutes.
+    const timedOut = await Promise.race([runtime.drain().then(() => false), new Promise<boolean>((r) => setTimeout(() => r(true), 45 * 60_000).unref())]);
+    const matched = (db.prepare("SELECT COUNT(*) FROM jobs WHERE status = 'matched'").pluck().get() as number) - matchedBefore;
+    const errors = db.prepare("SELECT COUNT(*) FROM companies WHERE active = 1 AND last_error IS NOT NULL AND last_polled_at >= ?").pluck().get(started) as number;
+    console.log(`polled ${boards} boards in ${Math.round((Date.now() - started) / 1000)}s${timedOut ? " (timed out, sending what we have)" : ""}; ${matched} new match(es); ${errors} board error(s)`);
+
+    const { sendDigest } = await import("./agents/jobs/digest.js");
+    console.log(`digest: ${await sendDigest(ctx)} job(s) sent`);
+    console.log(`done in ${Math.round((Date.now() - started) / 1000)}s`);
+    process.exit(0);
+  }
+  case "ui": {
+    // Local page of the last 7 days of matches with referral people; mark jobs applied and people messaged.
+    const port = Number(args[0] ?? 4310);
+    const url = await (await import("./agents/jobs/ui.js")).startUi(ctx, port);
+    console.log(`Jobs UI: ${url}  (Ctrl+C to stop)`);
+    if (!args.includes("--no-open")) (await import("node:child_process")).spawn("open", [url], { stdio: "ignore" });
+    await new Promise(() => undefined);
+    break;
+  }
+  case "schedule":
+  case "unschedule": {
+    // schedule [hours…]: run `sweep` every day at these hours (default 9 18). unschedule: stop.
+    const svc = await import("./core/service.js");
+    const hours = args.map(Number).filter((h) => Number.isInteger(h) && h >= 0 && h <= 23);
+    console.log(cmd === "schedule" ? svc.scheduleSweep(hours.length ? hours : [9, 18]) : svc.unscheduleSweep());
     break;
   }
   case "matches": {
@@ -353,7 +408,9 @@ switch (cmd) {
     console.log(`grokBot running${settings(ctx).dry_run ? " (DRY RUN: fills but never submits)" : ""}. Ctrl+C to stop.`);
     runtime.start();
     const count = (sql: string, ...p: unknown[]) => db.prepare(sql).pluck().get(...p) as number;
+    const { onReferralCallback } = await import("./agents/jobs/referrals.js");
     void tg.pollTelegram({
+      onCallback: (data, reply) => onReferralCallback(ctx, data, reply).then(() => undefined),
       commands: {
         status: async (_a, reply) => {
           const s = settings(ctx);
@@ -446,13 +503,17 @@ switch (cmd) {
     // Background bot under launchd, only while started; never at login.
     const svc = await import("./core/service.js");
     console.log(cmd === "start" ? svc.startService() : cmd === "stop" ? svc.stopService() : cmd === "restart" ? svc.restartService() : svc.serviceStatus());
+    if (cmd === "status") console.log(svc.sweepSchedule() ? `Sweep scheduled daily at ${svc.sweepSchedule()}.` : "No sweep scheduled (npm run bot -- schedule).");
     break;
   }
   default:
     console.log(`usage: npm run bot -- <command>
   seed                         resolve the starter company list into the directory
   add-company <names> [--hot]  add companies (hot = poll every 3 min)
-  poll                         poll all due boards once and score new postings
+  poll                         poll every board once and score new postings
+  sweep                        poll + score + Telegram digest with referral leads, then exit
+  ui [port]                    local page: last 7 days of matches, referrals, mark applied / messaged
+  schedule [hours…]            run sweep daily at these hours (default 9 18); unschedule to stop
   matches [n]                  show newest matched jobs
   rejections                   why postings were skipped
   run                          run continuously (polling + scoring)

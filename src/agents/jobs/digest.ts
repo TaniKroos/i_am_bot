@@ -1,9 +1,10 @@
 import type { AgentContext } from "../../core/agent.js";
 import { notifyOwner } from "../../core/channels/telegram.js";
 import { alreadyApplied } from "./applied.js";
+import { followUps, referralMessages } from "./referrals.js";
 
 /** Job statuses worth applying to by hand: matched, or stopped somewhere in the bot's own pipeline. */
-const OPEN = ["matched", "needs_user", "waiting_adapter", "tailoring", "ready", "applying", "dry_run"];
+export const OPEN = ["matched", "needs_user", "waiting_adapter", "tailoring", "ready", "applying", "dry_run"];
 
 export interface DigestJob {
   id: string;
@@ -40,14 +41,26 @@ function chunks(header: string, jobs: DigestJob[]): string[] {
   return out;
 }
 
-/** Send every pending match to Telegram and mark it sent. Returns how many went out. */
-export async function sendDigest(ctx: AgentContext): Promise<number> {
+/** Companies (best job each) that get a referral message per digest; two searches each, within Brave's free tier. */
+export const REFERRAL_COMPANIES = 8;
+
+/**
+ * Send every pending match to Telegram and mark it sent, then referral leads for the best few companies
+ * and any referral asks due a follow-up. Returns how many jobs went out.
+ */
+export async function sendDigest(ctx: AgentContext, opts: { referrals?: number } = {}): Promise<number> {
   const jobs = pendingDigest(ctx);
+  const due = followUps(ctx);
   if (!jobs.length) {
     await notifyOwner("📋 No new matches since the last digest.");
+    if (due) await notifyOwner(due.text, due.buttons);
     return 0;
   }
   for (const text of chunks(`📋 ${jobs.length} job(s) to apply to, best match first:`, jobs)) await notifyOwner(text);
+  const seen = new Set<string>();
+  const best = jobs.filter((j) => !seen.has(j.company_name.toLowerCase()) && seen.add(j.company_name.toLowerCase())).slice(0, opts.referrals ?? REFERRAL_COMPANIES);
+  for (const m of await referralMessages(ctx, best)) await notifyOwner(m.text, m.buttons);
+  if (due) await notifyOwner(due.text, due.buttons);
   const mark = ctx.db.prepare("UPDATE jobs SET digested_at = ? WHERE id = ?");
   const now = Date.now();
   ctx.db.transaction(() => jobs.forEach((j) => mark.run(now, j.id)))();

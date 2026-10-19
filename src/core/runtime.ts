@@ -15,6 +15,8 @@ export class Runtime {
   private running = new Map<string, number>(); // "agent:kind" -> in-flight count
   private timers: NodeJS.Timeout[] = [];
   private stopped = false;
+  /** When set, only these task kinds run (a find-only sweep must never pick up a queued application). */
+  private only?: Set<string>;
 
   register(agent: Agent): void {
     getDb();
@@ -55,6 +57,11 @@ export class Runtime {
     this.timers.push(setInterval(() => this.pump(), 250));
   }
 
+  /** Run only these task kinds from now on. */
+  restrict(kinds: string[]): void {
+    this.only = new Set(kinds);
+  }
+
   stop(): void {
     this.stopped = true;
     this.timers.forEach(clearInterval);
@@ -62,11 +69,16 @@ export class Runtime {
 
   /** Run tasks until the queue has nothing ready (used by one-shot CLI commands). */
   async drain(): Promise<void> {
+    const kinds = this.only ? [...this.only] : null;
+    const filter = kinds ? `AND kind IN (${kinds.map(() => "?").join(",")})` : "";
     for (;;) {
       this.pump();
       await new Promise((r) => setTimeout(r, 100));
       const inflight = [...this.running.values()].reduce((a, b) => a + b, 0);
-      const ready = getDb().prepare("SELECT COUNT(*) FROM tasks WHERE status='queued' AND run_at <= ?").pluck().get(Date.now()) as number;
+      const ready = getDb()
+        .prepare(`SELECT COUNT(*) FROM tasks WHERE status='queued' AND run_at <= ? ${filter}`)
+        .pluck()
+        .get(Date.now(), ...(kinds ?? [])) as number;
       if (!inflight && !ready) return;
     }
   }
@@ -75,6 +87,7 @@ export class Runtime {
     if (this.stopped) return;
     for (const agent of this.agents.values()) {
       for (const kind of Object.keys(agent.handlers)) {
+        if (this.only && !this.only.has(kind)) continue;
         const key = `${agent.id}:${kind}`;
         const limit = agent.concurrency?.[kind] ?? 1;
         while ((this.running.get(key) ?? 0) < limit) {

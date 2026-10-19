@@ -16,6 +16,8 @@ npm run bot -- <command> [args]   # every operation goes through src/cli.ts
 npm run bot -- apply <job> --dry-run   # end-to-end check on one job without submitting
 npm run bot -- fill <job>         # fill one Greenhouse form + screenshot, never submits
 npm run bot -- plan -v            # answer-engine dry run over Greenhouse matches
+npm run bot -- sweep              # one-shot find-only run: poll all boards, score, digest + referral leads, exit
+npm run bot -- schedule [9 18]    # sweep daily under launchd (com.grokbot.sweep in ~/Library/LaunchAgents); unschedule
 npm run bot -- run [--dry-run]    # long-running loop + Telegram commands (single instance via data/bot.pid; holds caffeinate)
 npm run bot -- start | stop | status   # same loop under launchd (com.grokbot.agent, plist in data/, never at login); logs in data/logs/bot.log
 docker build -t grokbot-latex:1 tools/latex   # required once for resume builds
@@ -40,6 +42,7 @@ npm 11 blocks install scripts: after adding native deps, run `npm install-script
 - **Claude Code worker**: `claude -p` on the owner's subscription (it strips `ANTHROPIC_API_KEY`) with `--strict-mcp-config` and `--tools` derived from the allowlist, which cuts per-turn context about 5×. Don't add MCP servers or broad tools to it. LaTeX tools are wrappers in `tools/latex/bin` that run the sandboxed container on `$PWD`.
 - **Applied ledger** (`applied.ts`, table `applied`): bot submissions + Gmail confirmations parsed into company / title / requisition id. `alreadyApplied()` runs in both pipeline steps; `appliedAtCompany()` (distinct) feeds the per-company cap. Gmail calls share a per-minute quota with security-code reading: keep syncs paced and incremental.
 - **Composer** (`apply/compose.ts`): required questions the rules return as `ask` (except EEO) go to one Sonnet call grounded in `profile/experience.md` + resume + profile. Text answers are checked with the truth-check helpers (numbers exact; unclaimed tech only inside a negating sentence). Results are stored in `applications.composed` and reused at submit via `planApplication(..., composed.values)`.
+- **Referrals** (`referrals.ts`): the digest's top companies get people found through Brave Search (`site:linkedin.com/in`, cached in `people` for 14 days), a template note filled from `profile.yaml` facts, and Sent / Followed up buttons stored in `outreach`. The bot never logs in to LinkedIn or messages anyone. `sweep` handles button taps queued since the last run (`pollTelegram({ once })`) and restricts the runtime to `poll_board` + `score_job`, so queued applications never run.
 - **Truth check** (`truthcheck.ts`) gates every tailored resume: numbers must exactly match the owner's sources (including `+`/`%`), JD-only technology terms are "borrowed", and `do_not_list_terms` are forbidden. It shares tokenisation with `resume-gap.ts`; change both together.
 
 ## Invariants

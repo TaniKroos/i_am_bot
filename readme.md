@@ -126,6 +126,22 @@ npm run bot -- variants approve ai-llm backend fullstack platform   # after revi
 
 ## Running it
 
+### Find jobs + referral leads, twice a day (recommended)
+
+```bash
+npm run bot -- sweep              # poll every board once, score, send the Telegram digest, exit
+npm run bot -- schedule           # run sweep every day at 9:00 and 18:00 (or: schedule 8 13 19)
+npm run bot -- unschedule         # stop the schedule
+```
+
+A sweep needs no Claude usage and nothing stays running in between. The digest lists every new match. For the best 8 companies it also sends a message with people who could refer you, a connection note to paste (written only from your `profile.yaml` facts, at most 200 characters), and LinkedIn search buttons that open in your own browser. The bot never logs in to LinkedIn or sends anything for you. Tap **✅ Sent** after messaging someone. The next sweep records it, and five days later the digest asks you to follow up.
+
+People come from Brave Search (`site:linkedin.com/in`, the company and your college). Add `BRAVE_API_KEY=…` to `.env` (free plan at api-dashboard.search.brave.com, about 2,000 queries a month). Each company is searched at most once every 14 days. Without a key you still get the note and the LinkedIn search buttons. To change the note, set `referral.note` in `profile/profile.yaml`. Placeholders: `{first} {role} {employer} {years} {title} {company}`.
+
+To see the last 7 days of matches in your browser, run `npm run bot -- ui` (http://localhost:4310, this Mac only). Each job has its Apply link, **Mark applied**, and under Referrals the people found, the note with a Copy button, and **Mark sent** for each person. Jobs you mark applied are left out of future digests. Older jobs drop off the page but stay in the database, so they are never reported as new again.
+
+### Continuous mode (apply mode)
+
 ```bash
 npm run bot -- run              # poll, score, prepare and submit continuously; listens on Telegram
 npm run bot -- run --dry-run    # same, but fills and screenshots without ever clicking Submit
@@ -160,7 +176,9 @@ To keep it running but stop Claude usage and submissions, send `/pause` on Teleg
 | `seed` | Resolve the starter list (`src/agents/jobs/seed.ts`) into the company directory |
 | `add-company <names…> [--hot]` | Find a company's board by name (Greenhouse / Lever / Ashby / SmartRecruiters / Workable) |
 | `add-url <url…> [--name X] [--hot]` | Add a board from any job or careers link (also Workday and Oracle) |
-| `poll` | Poll all due boards once and score new postings |
+| `poll` | Poll every board once and score new postings |
+| `ui [port]` | Local page of the last 7 days of matches: mark applied, referral people, copy the note, mark messaged |
+| `sweep` · `schedule [hours…]` · `unschedule` | Poll, score and send the digest with referral leads; run it daily at fixed hours |
 | `matches [n]` · `rejections` · `rescore` | Inspect matches, see why jobs were skipped, re-run scoring after editing the profile |
 | `plan [-v]` | Dry-run the answer engine over Greenhouse matches; refreshes `questions-pending.yaml` |
 | `fill <job>` | Fill one Greenhouse application and screenshot it, never submitting |
